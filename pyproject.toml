@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sc2-relay"
+version = "0.4.0"
+description = "SolarOS Sealed Chat (SC2) reference relay and the shared sans-IO sc2proto package"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["PyNaCl>=1.5"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+sc2-relay = "sc2_relay.__main__:main"
+sc2-relay-admin = "sc2_relay.admin:run"
+
+[tool.setuptools]
+packages = ["sc2proto", "sc2_relay"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

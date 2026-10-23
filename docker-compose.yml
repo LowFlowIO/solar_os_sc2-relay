@@ -1,0 +1,40 @@
+# Example deployment of the SC2 relay. Copy config/selfhost.env (or
+# config/official.env) to ./relay.env, edit it, put certificates in ./certs,
+# then:  docker compose up -d
+# The admin API listens on 127.0.0.1:7780 inside the container; reach it with
+#   docker compose exec relay python -m sc2_relay.admin status
+services:
+  relay:
+    build: .
+    image: sc2-relay:0.4.0
+    restart: unless-stopped
+    env_file: ./relay.env
+    environment:
+      SC2_DATA_DIR: /data
+    ports:
+      - "7778:7778"            # chats:// (TLS)
+      # - "7777:7777"          # chat:// plain, LAN only (SC2_PLAIN=true)
+      - "127.0.0.1:8080:8080"  # HTTP: put Caddy/Traefik with TLS in front for wss:// and the web view
+    volumes:
+      - relay-data:/data
+      - ./certs:/certs:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional TLS front end for https:// (web view, /.well-known) and wss://host/sc2.
+  # caddy:
+  #   image: caddy:2
+  #   restart: unless-stopped
+  #   ports: ["443:443", "80:80"]
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy-data:/data
+  #   # Caddyfile:  relay.example.org { reverse_proxy relay:8080 }
+
+volumes:
+  relay-data:
+  # caddy-data:
