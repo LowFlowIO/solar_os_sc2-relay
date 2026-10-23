@@ -10,11 +10,15 @@ from helpers import Clock, Device, admin, relay_server, run
 from sc2_relay.core import PUBLIC_LABEL, PUBLIC_NOTICE
 
 ROOM = "pub:general"
+# The rate-limit tests pin the limits they assert on: the relay defaults are
+# deployment policy (see relay/README.md and config/official.env) and change.
+LIMITS = dict(post_per_min=10, post_burst=5, ip_post_per_min=30, ip_post_burst=10, room_post_per_min=600,
+              slow_key_minutes=0, slow_per_min=2, slow_burst=1, slow_body_max=256)
 
 
 def test_list_join_notice_and_label():
     async def body():
-        async with relay_server(public_rooms=["pub:general", "pub:solar-dev"]) as srv:
+        async with relay_server(public_rooms=["pub:general", "pub:solar-dev"], **LIMITS) as srv:
             d = Device()
             await d.connect(srv.ports["plain"])
             rid = d.rid()
@@ -99,7 +103,7 @@ def test_post_ingest_pipeline():
 def test_body_limit_and_slow_mode_for_young_keys():
     async def body():
         clock = Clock()
-        async with relay_server(clock=clock, slow_key_minutes=10) as srv:
+        async with relay_server(clock=clock, **dict(LIMITS, slow_key_minutes=10)) as srv:
             port = srv.ports["plain"]
             d = Device()
             await d.connect(port)
@@ -125,7 +129,7 @@ def test_body_limit_and_slow_mode_for_young_keys():
 def test_rate_limits_per_key_and_room_slow_mode():
     async def body():
         clock = Clock()
-        async with relay_server(clock=clock) as srv:
+        async with relay_server(clock=clock, **LIMITS) as srv:
             port = srv.ports["plain"]
             d = Device()
             await d.connect(port)

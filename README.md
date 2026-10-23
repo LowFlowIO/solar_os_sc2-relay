@@ -201,10 +201,10 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_WEB_PAGE_SIZE` | `100` | Posts per HTML page. |
 | `SC2_WEB_RATE_PER_MIN` | `120` | Web view requests per IP per minute. |
 | `SC2_MUTES` | `false` | Self-host mutes (`403 muted`). Not allowed under the official profile. |
-| `SC2_POST_PER_MIN` / `SC2_POST_BURST` | `10` / `5` | Public posts per key. |
-| `SC2_IP_POST_PER_MIN` / `SC2_IP_POST_BURST` | `30` / `10` | Public posts per IP. |
-| `SC2_ROOM_POST_PER_MIN` | `600` | Public posts per room. |
-| `SC2_SLOW_KEY_MINUTES` | `10` | A key younger than this is in slow mode. |
+| `SC2_POST_PER_MIN` / `SC2_POST_BURST` | `100000` / `100000` (official: `10` / `5`) | Public posts per key. The selfhost defaults are effectively unlimited; set real limits for an open relay. |
+| `SC2_IP_POST_PER_MIN` / `SC2_IP_POST_BURST` | `100000` / `100000` (official: `30` / `10`) | Public posts per IP. |
+| `SC2_ROOM_POST_PER_MIN` | `1000000` (official: `600`) | Public posts per room. |
+| `SC2_SLOW_KEY_MINUTES` | `0` (official: `10`) | A key younger than this is in slow mode (0 = off). |
 | `SC2_SLOW_UNTIL_POSTS` | `0` | Also keep a key in slow mode until it has this many accepted posts (0 = off). |
 | `SC2_SLOW_PER_MIN` / `SC2_SLOW_BURST` / `SC2_SLOW_BODY_MAX` | `2` / `1` / `256` | Slow-mode limits. |
 | `SC2_SEND_PER_MIN` / `SC2_SEND_BURST` | `120` / `30` | DM and room sends per device. |
