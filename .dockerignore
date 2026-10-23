@@ -1,3 +1,4 @@
+.git
 tests
 **/__pycache__
 **/*.pyc

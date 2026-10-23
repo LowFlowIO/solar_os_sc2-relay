@@ -1,13 +1,13 @@
-# SC2 reference relay (`relay/`)
+# SC2 reference relay
 
-This directory holds two Python packages for SolarOS Sealed Chat (SC2, protocol draft v2):
+This repository holds two Python packages for SolarOS Sealed Chat (SC2, protocol draft v2):
 
 | Package | What it is |
 |---|---|
 | `sc2proto/` | A shared **sans-IO**, pure-Python protocol package. It covers frame codec, validation, canonical signed-byte layouts, error table, room state machine and limit helpers. It only uses `json`, `struct` and `binascii`, plus `hashlib` when present (`sc2proto.layouts.set_sha256()` lets a port without hashlib plug in its own). It does no I/O and no signing, so it can be shared by the relay, the Python test client and future ports. |
 | `sc2_relay/` | The **asyncio reference relay**. It provides v2 NDJSON over TLS (`chats://`, port 7778) and plain TCP (`chat://`, port 7777, off by default), WebSocket at `/sc2`, an HTTP surface (well-known, health, metrics, read-only web view), a loopback admin API with CLI, a chatd-compatible legacy v1 hub, and SQLite storage with migrations. Its only dependency is PyNaCl, used for Ed25519 verify and sign. |
 
-The relay is **isolated from the firmware core**: it is shipped separately from the SolarOS client code (device firmware, `protocol/sc2`, `chatd`), imports nothing from it and builds nothing from the C tree. The one exception is the optional C cross test, which compiles the client's C SC2 engine against the relay on the host; it finds the client checkout through `SC2_CLIENT_DIR` (see Tests). The relay is a separate deployable with its own tests.
+The relay is **isolated from the firmware core**: it is its own repository, separate from the SolarOS client code (device firmware, `protocol/sc2`, `chatd`; paths such as `protocol/sc2/...` below refer to the client repository), imports nothing from it and builds nothing from the C tree. The one exception is the optional C cross test, which compiles the client's C SC2 engine against the relay on the host; it finds the client checkout through `SC2_CLIENT_DIR` (see Tests). The relay is a separate deployable with its own tests.
 
 ## What the relay does (and does not) see
 
@@ -28,7 +28,6 @@ The relay is **isolated from the firmware core**: it is shipped separately from 
 Requirements: Python ≥ 3.9 and PyNaCl.
 
 ```sh
-cd relay
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
 python -m pytest -q                     # full test suite (C interop test needs gcc)
@@ -100,8 +99,7 @@ The TLS key is separate from the relay's Ed25519 **signing** key (`relay_key`), 
 ### Docker
 
 ```sh
-cd relay
-docker build -t sc2-relay .
+docker build -t sc2-relay .      # from the repository root
 cp config/official.env relay.env   # or selfhost.env; edit it (see TLS above)
 docker compose up -d
 docker compose exec relay python -m sc2_relay.admin status
@@ -279,15 +277,15 @@ The three records are fixed-size binary so a device can build and verify them wi
 
 ## Tests
 
-`python -m pytest -q` from `relay/` runs the suite. It stands alone: the Python reference client (`tests/vendor/sc2ref.py`) and the golden vectors (`tests/data/sc2_vectors.json`) are vendored copies from the client repository (see `tests/vendor/README.md`). Only the C cross test needs the client checkout and skips cleanly without it:
+`python -m pytest -q` from the repository root runs the suite. It stands alone: the Python reference client (`tests/vendor/sc2ref.py`) and the golden vectors (`tests/data/sc2_vectors.json`) are vendored copies from the client repository (see `tests/vendor/README.md`). Only the C cross test needs the client checkout and skips cleanly without it:
 
 ```sh
 python3 -m venv /path/venv && /path/venv/bin/pip install -r requirements-dev.txt
-cd relay && /path/venv/bin/python -m pytest -q                        # cross test skipped
+/path/venv/bin/python -m pytest -q                        # cross test skipped
 SC2_CLIENT_DIR=/path/to/solar_os_client /path/venv/bin/python -m pytest -q   # cross test runs (needs gcc/cc, or CC=...)
 ```
 
-`SC2_CLIENT_DIR` is a checkout of SolarOS main with the SC2 client patches applied; the default is a sibling directory called `solar_os`. It covers:
+`SC2_CLIENT_DIR` is a checkout of SolarOS main with the SC2 client patches applied; the default is a sibling directory of this repository called `solar_os` (`../solar_os`). It covers:
 
 | Area | What it covers |
 |---|---|

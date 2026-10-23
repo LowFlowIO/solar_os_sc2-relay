@@ -3,7 +3,7 @@ built with gcc into a small harness, talk to this Python relay over TCP.
 
 The C sources come from the SolarOS client checkout (main + SC2 client
 patches): set SC2_CLIENT_DIR to it (default: a sibling "solar_os" directory
-of this repository, or of relay/). Skipped when gcc or the client checkout
+of this repository, i.e. ../solar_os). Skipped when gcc or the client checkout
 is not available.
 
 SPDX-License-Identifier: MIT
@@ -25,11 +25,11 @@ def _client_dir():
     env = os.environ.get("SC2_CLIENT_DIR")
     if env:
         return os.path.abspath(env)
-    for rel in (("..", "..", "..", "solar_os"), ("..", "..", "solar_os")):
+    for rel in (("..", "..", "solar_os"),):
         cand = os.path.abspath(os.path.join(HERE, *rel))
         if os.path.isdir(os.path.join(cand, "protocol", "sc2")):
             return cand
-    return os.path.abspath(os.path.join(HERE, "..", "..", "..", "solar_os"))
+    return os.path.abspath(os.path.join(HERE, "..", "..", "solar_os"))
 
 
 REPO = _client_dir()

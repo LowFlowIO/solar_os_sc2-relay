@@ -11,7 +11,7 @@ from sc2_relay.core import PUBLIC_LABEL, PUBLIC_NOTICE
 
 ROOM = "pub:general"
 # The rate-limit tests pin the limits they assert on: the relay defaults are
-# deployment policy (see relay/README.md and config/official.env) and change.
+# deployment policy (see README.md and config/official.env) and change.
 LIMITS = dict(post_per_min=10, post_burst=5, ip_post_per_min=30, ip_post_burst=10, room_post_per_min=600,
               slow_key_minutes=0, slow_per_min=2, slow_burst=1, slow_body_max=256)
 

@@ -1,6 +1,6 @@
 # SC2 reference relay. Build from the repository root:
-#   docker build -f relay/Dockerfile -t sc2-relay relay
-# (the build context is relay/; the C interop test is not part of the image)
+#   docker build -t sc2-relay .
+# (the build context is the repository root; tests/ is excluded by .dockerignore)
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

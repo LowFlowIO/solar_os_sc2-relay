@@ -3,7 +3,7 @@
 Two profiles share one codebase:
 - selfhost (default): legacy v1 on, web view off, mutes allowed.
 - official: v2 only (v1 hello gets 426), web view on, no mutes.
-Every value can still be set explicitly; see relay/README.md for the table.
+Every value can still be set explicitly; see README.md for the table.
 
 SPDX-License-Identifier: MIT
 """
