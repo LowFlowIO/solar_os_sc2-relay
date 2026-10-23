@@ -14,6 +14,8 @@ import sqlite3
 
 from sc2proto import dumps
 
+from . import fsperm
+
 MIGRATIONS = [
     # 1: the SC2 v2 relay
     """
@@ -97,7 +99,10 @@ class Storage:
         self.path = path
         if path != ":memory:":
             d = os.path.dirname(os.path.abspath(path))
-            os.makedirs(d, exist_ok=True)
+            if not os.path.isdir(d):
+                fsperm.private_dir(d)
+            # SQLite gives -wal/-shm the database file's mode, so create it 0600 first
+            fsperm.private_file(path)
         self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
@@ -105,6 +110,9 @@ class Storage:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=NORMAL")
         self.migrate()
+        if path != ":memory:":
+            for f in fsperm.sqlite_files(path):
+                fsperm.tighten_file(f)
 
     # ---------------- schema ----------------
 

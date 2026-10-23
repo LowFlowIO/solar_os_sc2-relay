@@ -7,8 +7,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     SC2_DATA_DIR=/data
 
-RUN groupadd --system sc2 && useradd --system --gid sc2 --home-dir /data --no-create-home sc2 \
-    && mkdir -p /data /app && chown sc2:sc2 /data
+# Fixed UID/GID 10001 so the certbot sidecar's deploy hook can hand the key
+# to the relay (deploy/certbot/deploy-hook.sh, SC2_RELAY_UID/GID).
+RUN groupadd --system --gid 10001 sc2 \
+    && useradd --system --uid 10001 --gid sc2 --home-dir /data --no-create-home sc2 \
+    && mkdir -p /data /app && chown sc2:sc2 /data && chmod 0700 /data
 
 WORKDIR /app
 COPY requirements.txt /app/

@@ -1,23 +1,35 @@
 # Example deployment of the SC2 relay. Copy config/selfhost.env (or
-# config/official.env) to ./relay.env, edit it, put certificates in ./certs,
-# then:  docker compose up -d
+# config/official.env) to ./relay.env and edit it, then:  docker compose up -d
+#
+# TLS with Let's Encrypt (default): set SC2_ACME_DOMAIN and SC2_ACME_EMAIL in
+# relay.env and point the domain's DNS at this host. The certbot service
+# answers HTTP-01 on port 80, keeps one ECDSA key (--reuse-key, so device
+# #pin= pins survive renewals), renews every 12 h and drops the pair into the
+# relay-certs volume; the relay hot-reloads it without dropping connections.
+# Until the first certificate exists the relay serves HTTP only and opens
+# chats:// as soon as it lands. Logs: docker compose logs certbot
+#
+# Own certificates instead: remove the certbot service, replace the
+# relay-certs volume with  - ./certs:/certs:ro  and set SC2_TLS_CERT/SC2_TLS_KEY.
+#
 # The admin API listens on 127.0.0.1:7780 inside the container; reach it with
 #   docker compose exec relay python -m sc2_relay.admin status
 services:
   relay:
     build: .
-    image: sc2-relay:0.4.0
+    image: sc2-relay:0.4.1
     restart: unless-stopped
     env_file: ./relay.env
     environment:
       SC2_DATA_DIR: /data
+      SC2_ACME_CERT_DIR: /certs
     ports:
       - "7778:7778"            # chats:// (TLS)
       # - "7777:7777"          # chat:// plain, LAN only (SC2_PLAIN=true)
       - "127.0.0.1:8080:8080"  # HTTP: put Caddy/Traefik with TLS in front for wss:// and the web view
     volumes:
       - relay-data:/data
-      - ./certs:/certs:ro
+      - relay-certs:/certs:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -25,7 +37,29 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    env_file: ./relay.env
+    environment:
+      SC2_RELAY_UID: "10001"   # the relay image's fixed user (Dockerfile)
+      SC2_RELAY_GID: "10001"
+    entrypoint: ["/bin/sh", "/hooks/run.sh"]
+    ports:
+      - "80:80"                # HTTP-01 (standalone). With SC2_ACME_WEBROOT, drop this and mount the webroot.
+    volumes:
+      - letsencrypt:/etc/letsencrypt     # account, lineage and the reused key
+      - relay-certs:/certs               # copies for the relay (0600, owned by 10001)
+      - ./deploy/certbot:/hooks:ro
+      # - ./acme-webroot:/var/www/acme   # SC2_ACME_WEBROOT=/var/www/acme
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE, CHOWN, FOWNER, DAC_OVERRIDE]
+    security_opt:
+      - no-new-privileges:true
+
   # Optional TLS front end for https:// (web view, /.well-known) and wss://host/sc2.
+  # Caddy gets its own certificate; if it takes port 80, run certbot with
+  # SC2_ACME_WEBROOT and let Caddy serve /.well-known/acme-challenge/ from it.
   # caddy:
   #   image: caddy:2
   #   restart: unless-stopped
@@ -37,4 +71,6 @@ services:
 
 volumes:
   relay-data:
+  relay-certs:
+  letsencrypt:
   # caddy-data:

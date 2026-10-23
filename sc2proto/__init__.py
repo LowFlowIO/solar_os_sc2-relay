@@ -16,4 +16,4 @@ from . import frames, layouts, limits, rooms
 __all__ = ["ERRORS", "ProtocolError", "error_frame", "LineBuffer", "b64d", "b64e", "dumpb", "dumps", "hexd",
            "hexe", "is_hex", "loads", "valid_text", "frames", "layouts", "limits", "rooms"]
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

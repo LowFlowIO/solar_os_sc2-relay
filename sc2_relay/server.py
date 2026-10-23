@@ -12,6 +12,7 @@ SPDX-License-Identifier: MIT
 import asyncio
 import logging
 import os
+import ssl
 import struct
 
 from sc2proto import ProtocolError, dumpb
@@ -28,6 +29,8 @@ log = logging.getLogger("sc2_relay.server")
 class RelayServer:
     def __init__(self, config, clock=None, store=None, key=None):
         self.config = config
+        if store is None or key is None:
+            ensure_data_dir(config)
         if store is None:
             store = Storage(config.database)
         if key is None:
@@ -41,12 +44,20 @@ class RelayServer:
         self._tasks = []
         self._conns = set()
         self.ssl = None
+        self._tls_seen = None
         if config.tls_enabled:
-            self.ssl = tlsutil.server_context(config.tls_cert, config.tls_key)
-            try:
-                self.relay.tls_pin = tlsutil.spki_pin(config.tls_cert)
-            except (ValueError, OSError) as e:
-                log.warning("could not compute the TLS pin: %s", e)
+            self._tls_seen = tlsutil.file_stamp(config.tls_cert, config.tls_key)
+            if config.acme_domain and None in self._tls_seen:
+                # first start with the certbot sidecar: the TLS listener opens once the files exist
+                log.info("waiting for the Let's Encrypt certificate for %s in %s", config.acme_domain,
+                         os.path.dirname(config.tls_cert))
+                self._tls_seen = None
+            else:
+                self.ssl = tlsutil.server_context(config.tls_cert, config.tls_key)
+                try:
+                    self.relay.tls_pin = tlsutil.spki_pin(config.tls_cert)
+                except (ValueError, OSError) as e:
+                    log.warning("could not compute the TLS pin: %s", e)
         self.http = PublicHttp(self.relay, self._websocket)
         self.admin = AdminHttp(self.relay)
 
@@ -54,11 +65,12 @@ class RelayServer:
         c = self.config
         if not c.tls_enabled and not c.plain and not (c.http_port and c.websocket):
             raise RuntimeError("no client listener: set SC2_TLS_CERT/SC2_TLS_KEY, SC2_PLAIN=true or SC2_HTTP_PORT")
-        if c.acme_domain and not c.tls_enabled:
-            log.warning("SC2_ACME_DOMAIN is not implemented in the reference relay; terminate TLS with "
-                        "certbot/Caddy and set SC2_TLS_CERT/SC2_TLS_KEY (see README)")
-        if c.tls_enabled:
+        if c.http_tls and self.ssl is None:
+            raise RuntimeError("SC2_HTTP_TLS needs the certificate at startup (%s is missing)" % c.tls_cert)
+        if c.tls_enabled and self.ssl is not None:
             await self._listen("tls", lambda r, w: self._ndjson(r, w, "tls"), c.bind, c.tls_port, self.ssl)
+        if c.tls_enabled:
+            self._tasks.append(asyncio.ensure_future(self._tls_watch_loop()))
         if c.plain:
             await self._listen("plain", lambda r, w: self._ndjson(r, w, "tcp"), c.bind, c.plain_port, None)
         if c.http_port:
@@ -72,6 +84,55 @@ class RelayServer:
         self._tasks.append(asyncio.ensure_future(self._retention_loop()))
         log.info("relay %s up (profile %s, legacy_v1=%s, web_view=%s): %s", self.relay.relay_id, c.profile,
                  c.legacy_v1, c.web_view, ", ".join("%s:%d" % kv for kv in sorted(self.ports.items())))
+
+    # ---------------- TLS hot reload ----------------
+
+    def reload_tls(self, force=False):
+        """Reload SC2_TLS_CERT/SC2_TLS_KEY if they changed (or always with force,
+        e.g. on SIGHUP). Existing connections are not touched. Returns True when a
+        new certificate is live. A broken or half-written pair is logged and
+        skipped; the old certificate stays in use."""
+        c = self.config
+        if not c.tls_enabled:
+            return False
+        stamp = tlsutil.file_stamp(c.tls_cert, c.tls_key)
+        if None in stamp or (not force and stamp == self._tls_seen):
+            return False
+        self._tls_seen = stamp
+        try:
+            ctx, pin = tlsutil.reload_context(self.ssl, c.tls_cert, c.tls_key)
+        except (ssl.SSLError, OSError, ValueError) as e:
+            self.relay.metrics["tls_reload_failures_total"] += 1
+            log.warning("TLS reload skipped, keeping the current certificate: %s", e)
+            return False
+        first = self.ssl is None
+        self.ssl = ctx
+        old = self.relay.tls_pin
+        self.relay.tls_pin = pin
+        self.relay.metrics["tls_reloads_total"] += 1
+        if old and pin != old:
+            log.warning("TLS key changed: SPKI pin %s -> %s. Devices pinned with #pin= must re-pin; "
+                        "use certbot --reuse-key to keep the key across renewals (README: key rotation)", old, pin)
+        else:
+            log.info("TLS certificate %s (pin %s)", "loaded" if first else "reloaded", pin)
+        return True
+
+    async def _tls_watch_loop(self):
+        c = self.config
+        while True:
+            if self.ssl is None:
+                await asyncio.sleep(min(5, c.tls_reload_interval or 5))
+            elif c.tls_reload_interval:
+                await asyncio.sleep(c.tls_reload_interval)
+            else:
+                return  # polling off; SIGHUP still reloads
+            self.reload_tls()
+            if self.ssl is not None and "tls" not in self.ports:
+                try:
+                    await self._listen("tls", lambda r, w: self._ndjson(r, w, "tls"), c.bind, c.tls_port, self.ssl)
+                    log.info("chats:// listener up on %s:%d", c.bind, self.ports["tls"])
+                except OSError:
+                    log.exception("could not open the TLS listener")
 
     async def _listen(self, name, cb, host, port, ssl_ctx):
         srv = await asyncio.start_server(cb, host, port, ssl=ssl_ctx, limit=1 << 16)
@@ -287,10 +348,15 @@ async def run(config):
             loop.add_signal_handler(sig, stop.set)
         except (NotImplementedError, RuntimeError):
             pass
+    try:
+        loop.add_signal_handler(signal.SIGHUP, lambda: srv.reload_tls(force=True))
+    except (AttributeError, NotImplementedError, RuntimeError):
+        pass
     await stop.wait()
     log.info("shutting down")
     await srv.close()
 
 
 def ensure_data_dir(config):
-    os.makedirs(config.data_dir, exist_ok=True)
+    from . import fsperm
+    fsperm.private_dir(config.data_dir)

@@ -9,6 +9,7 @@ SPDX-License-Identifier: MIT
 """
 
 import os
+import re
 
 from sc2proto import frames, is_hex, limits
 
@@ -97,7 +98,11 @@ class Config:
             "tls_cert": _str(env, "SC2_TLS_CERT", ""),
             "tls_key": _str(env, "SC2_TLS_KEY", ""),
             "tls_port": _int(env, "SC2_TLS_PORT", 7778, 0, 65535),
+            # Let's Encrypt via the certbot sidecar (or plain certbot): the relay only
+            # reads <acme_cert_dir>/fullchain.pem and privkey.pem and hot-reloads them
             "acme_domain": _str(env, "SC2_ACME_DOMAIN", ""),
+            "acme_cert_dir": _str(env, "SC2_ACME_CERT_DIR", "/certs"),
+            "tls_reload_interval": _int(env, "SC2_TLS_RELOAD_INTERVAL", 60, 0, 86400),
             "plain": _bool(env, "SC2_PLAIN", False),
             "plain_port": _int(env, "SC2_PLAIN_PORT", 7777, 0, 65535),
             # HTTP: well-known, healthz, metrics, web view, wss:///sc2
@@ -203,6 +208,13 @@ class Config:
             raise ConfigError("SC2_PUBLIC_ROOM_CREATE must be operator or any")
         if not self.relay_id or len(self.relay_id.encode()) > 255:
             raise ConfigError("SC2_RELAY_ID must be 1..255 bytes")
+        if self.acme_domain:
+            if not re.fullmatch(r"(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}",
+                                self.acme_domain):
+                raise ConfigError("SC2_ACME_DOMAIN must be a public DNS name")
+            if not self.tls_cert and not self.tls_key:
+                self.tls_cert = os.path.join(self.acme_cert_dir, "fullchain.pem")
+                self.tls_key = os.path.join(self.acme_cert_dir, "privkey.pem")
         if bool(self.tls_cert) != bool(self.tls_key):
             raise ConfigError("SC2_TLS_CERT and SC2_TLS_KEY must be set together")
         if self.http_tls and not self.tls_enabled:

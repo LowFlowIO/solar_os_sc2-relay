@@ -7,18 +7,18 @@ This directory holds two Python packages for SolarOS Sealed Chat (SC2, protocol 
 | `sc2proto/` | A shared **sans-IO**, pure-Python protocol package. It covers frame codec, validation, canonical signed-byte layouts, error table, room state machine and limit helpers. It only uses `json`, `struct` and `binascii`, plus `hashlib` when present (`sc2proto.layouts.set_sha256()` lets a port without hashlib plug in its own). It does no I/O and no signing, so it can be shared by the relay, the Python test client and future ports. |
 | `sc2_relay/` | The **asyncio reference relay**. It provides v2 NDJSON over TLS (`chats://`, port 7778) and plain TCP (`chat://`, port 7777, off by default), WebSocket at `/sc2`, an HTTP surface (well-known, health, metrics, read-only web view), a loopback admin API with CLI, a chatd-compatible legacy v1 hub, and SQLite storage with migrations. Its only dependency is PyNaCl, used for Ed25519 verify and sign. |
 
-The relay is **isolated from the firmware core**: nothing outside `relay/` imports it, and it builds nothing from the C tree. The one exception is the optional C interop test, which compiles the C SC2 engine against the relay on the host. The protocol draft names `server/sc2_relay/` as the location; this phase uses the top-level `relay/` directory as requested for Phase 4.
+The relay is **isolated from the firmware core**: nothing outside `relay/` imports it, and it builds nothing from the C tree. The one exception is the optional C interop test, which compiles the C SC2 engine against the relay on the host. `relay/` is the decided location (draft §10.1, Phase 4b): the relay is a separate deployable with its own tests, kept out of the firmware tree.
 
 ## What the relay does (and does not) see
 
 * **DMs** are opaque Double Ratchet envelopes. The relay checks only the routing header (`from`, `to`, sizes) and stores each envelope in a per-device queue. Queues are bounded by 7 days, 500 messages and 5 MB per device; when a queue is full, the send gets `507 inbox_full`. Envelopes are deleted on `ack`.
-* **Private rooms** carry ciphertext only. Membership changes are **admin-signed commits**, which the relay verifies before applying (see the layouts below). A room has at most 32 members. A removed device gets a `room.event removed` notice in its own inbox, and routing to it stops at once. New members get **no history**: they sync from their join sequence. Sharing older messages is the opt-in client-side `room.share`.
+* **Private rooms** carry ciphertext only. Membership changes are **admin-signed commits**, one change per commit, chained by commit ID; the relay verifies and sequences them before applying (see the wire formats below). A room has at most 32 members. A removed device gets a `room.event removed` notice in its own inbox, and routing to it stops at once. New members get **no history**: they sync from their join sequence. Sharing older messages is the opt-in client-side `room.share`.
 * **Public rooms** are signed plaintext. The relay **verifies every post signature on ingest**, keeps at most 7 days or 10,000 posts per room, and accepts bodies of at most 1,024 bytes. The first time a device joins a public room it gets a notice with the `PUBLIC · not encrypted` label. Rooms come from configuration (`SC2_PUBLIC_ROOMS`); clients cannot create them unless `SC2_PUBLIC_ROOM_CREATE=any`.
 * **Anti-spam** is limited to rate limits (per key, per IP, per room) and **slow mode**. Slow mode applies to young keys automatically (`SC2_SLOW_KEY_MINUTES`, optional `SC2_SLOW_UNTIL_POSTS`), and the operator can turn it on for a whole room. Nothing filters content.
 * **Moderation** covers public rooms only:
   * Removals are **relay-signed** `room.mod` events. Clients verify them against the relay key published in `/.well-known/solaros-relay`.
   * Bans target a key, an IP, or both, for an operator-set duration (or indefinitely).
-  * Key bans are announced as a signed `room.mod ban`; IP bans are silent.
+  * Key bans are announced as a signed `room.mod ban`, and lifting one early as `room.mod unban`; IP bans are silent.
   * Private rooms and DMs cannot be moderated by the relay, because it cannot read them.
 * **Legacy v1** is chatd-compatible, for existing SolarOS gateways. It is **insecure**: no encryption and no signatures. It is on by default for self-hosting (`SC2_LEGACY_V1=true`) and lives in a separate namespace (`v1_channels` and `v1_log` tables) that is **never bridged** to SC2 rooms. The official profile turns it off; a v1 hello then gets `426 upgrade_required`.
 * **Web view** is read-only. It serves HTML pages and JSON (`/api/public/<room>`) of the signed public posts, with `noindex` both as a meta tag and as an `X-Robots-Tag` header. It is on in the official profile and off by default for self-hosting.
@@ -43,18 +43,55 @@ python -m sc2_relay --env-file config/selfhost.env --print-config   # effective 
 python -m sc2_relay --env-file config/selfhost.env
 ```
 
-On first start the relay creates its Ed25519 signing key at `$SC2_DATA_DIR/relay_key` (mode 0600) and its database at `$SC2_DATA_DIR/relay.sqlite3`. Migrations run automatically. **Back up `relay_key`**: clients pin the relay key, so losing it means every client must re-trust the relay.
+On first start the relay creates its Ed25519 signing key at `$SC2_DATA_DIR/relay_key` and its database at `$SC2_DATA_DIR/relay.sqlite3`. Migrations run automatically. **File modes do not depend on the umask:** the data directory is `0700`, and the database, its `-wal`/`-shm` files and the key are `0600`; looser modes on existing files are tightened at every start (a warning is logged if the relay does not own the file). **Back up `relay_key`**: clients pin the relay key, so losing it means every client must re-trust the relay.
 
 ### TLS (`chats://`)
 
-Set `SC2_TLS_CERT` and `SC2_TLS_KEY` (PEM). The relay requires TLS 1.2 or newer. `/.well-known/solaros-relay` publishes `tls_pin` (the SHA-256 of the certificate's SubjectPublicKeyInfo), so a self-signed certificate works with `chats://host:7778#pin=sha256/<tls_pin>`. A self-signed certificate for testing:
+Set `SC2_TLS_CERT` and `SC2_TLS_KEY` (PEM), or `SC2_ACME_DOMAIN` (below). The relay requires TLS 1.2 or newer.
+
+**Pins are SPKI-based.** `/.well-known/solaros-relay` publishes `tls_pin`, the SHA-256 of the certificate's **SubjectPublicKeyInfo** (the public key), base64, as `sha256/<b64>`. Devices that cannot use a CA chain (self-signed relays) connect with `chats://host:7778#pin=sha256/<b64>`. Because the pin covers the key and not the certificate, a renewed certificate for the **same key** keeps every pin valid; only a new key changes it. A self-signed certificate for testing:
 
 ```sh
-openssl req -x509 -newkey ed25519 -nodes -days 365 -subj "/CN=chat.home.example" \
-  -keyout certs/key.pem -out certs/cert.pem
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 365 \
+  -subj "/CN=chat.home.example" -keyout certs/key.pem -out certs/cert.pem
 ```
 
-**ACME is not built in.** If `SC2_ACME_DOMAIN` is set, the relay logs a warning and continues. Obtain and renew certificates with certbot or Caddy, then restart or reload the relay. The `SC2_ACME_DOMAIN` value is reserved for later use.
+**Hot reload.** The relay watches the two files (every `SC2_TLS_RELOAD_INTERVAL` seconds, default 60, `0` = off) and reloads them on `SIGHUP`. A changed pair is copied once, checked in a scratch TLS context (certificate parses, key matches) and only then loaded into the live context: established connections keep their session, new handshakes get the new certificate, and `tls_pin` in `/.well-known` follows. A broken or half-written pair is logged and skipped, and the old certificate stays in use (`tls_reload_failures_total` in `/metrics`, successful reloads in `tls_reloads_total`). Replace files by writing a temporary file and renaming it.
+
+#### Let's Encrypt with Docker (cloud relays)
+
+`docker-compose.yml` includes a `certbot` sidecar (`deploy/certbot/run.sh`):
+
+1. Point the domain's DNS at the host and open port 80 (HTTP-01) and 7778.
+2. In `relay.env` set `SC2_ACME_DOMAIN=relay.example.org` and `SC2_ACME_EMAIL=ops@example.org` (try `SC2_ACME_STAGING=true` first). Leave `SC2_TLS_CERT`/`SC2_TLS_KEY` unset: with `SC2_ACME_DOMAIN` they default to `$SC2_ACME_CERT_DIR/fullchain.pem` and `privkey.pem` (`/certs`).
+3. `docker compose up -d`. certbot gets the certificate (standalone on :80; or set `SC2_ACME_WEBROOT` if a web server you already run answers `/.well-known/acme-challenge/` from a shared directory), and its deploy hook (`deploy/certbot/deploy-hook.sh`) copies the pair into the `relay-certs` volume, `0600`, owned by the relay's fixed UID/GID 10001. Until the first certificate exists the relay serves HTTP only and opens `chats://` as soon as the files appear.
+4. Renewal: certbot runs `certbot renew` every 12 hours (`SC2_ACME_RENEW_INTERVAL`) and renews within 30 days of expiry. The relay hot-reloads the new pair; nothing restarts.
+
+certbot always runs with **`--reuse-key`** (ECDSA P-256), so the SPKI pin stays the same across the 90-day renewals. Do not remove it: without it every renewal changes the pin and breaks pinned devices.
+
+#### Plain certbot (no Docker)
+
+```sh
+sudo certbot certonly --standalone -d relay.example.org -m ops@example.org --agree-tos \
+  --key-type ecdsa --elliptic-curve secp256r1 --reuse-key \
+  --deploy-hook 'install -m 0600 -o sc2 -g sc2 $RENEWED_LINEAGE/privkey.pem /etc/sc2-relay/tls/privkey.pem.new &&
+                 mv /etc/sc2-relay/tls/privkey.pem.new /etc/sc2-relay/tls/privkey.pem &&
+                 install -m 0600 -o sc2 -g sc2 $RENEWED_LINEAGE/fullchain.pem /etc/sc2-relay/tls/fullchain.pem.new &&
+                 mv /etc/sc2-relay/tls/fullchain.pem.new /etc/sc2-relay/tls/fullchain.pem &&
+                 pkill -HUP -f "python -m sc2_relay" || true'
+```
+
+Then set `SC2_TLS_CERT=/etc/sc2-relay/tls/fullchain.pem` and `SC2_TLS_KEY=/etc/sc2-relay/tls/privkey.pem` (or `SC2_ACME_DOMAIN` with `SC2_ACME_CERT_DIR=/etc/sc2-relay/tls`). The distribution's `certbot.timer` (or cron `certbot renew`) does the renewals; `--reuse-key` is stored in the renewal config, and the hook copies and signals the relay. If the relay user can read `/etc/letsencrypt/live/<domain>/` you can point the two variables there directly; the watcher follows the symlinks. Use `--webroot -w <dir>` instead of `--standalone` if a web server already owns port 80.
+
+#### Key rotation
+
+Rotate the TLS key only when needed (suspected compromise, algorithm change). It changes the pin:
+
+1. Generate the new key and publish the **new** pin ahead of time (announcement, project page). Devices with a CA-validated `chats://` URL need nothing; pinned devices must update their `#pin=`.
+2. Rotate: `certbot renew --force-renewal --cert-name sc2-relay --new-key` (Docker: `docker compose exec certbot certbot renew --force-renewal --cert-name sc2-relay --new-key`; certbot ≥ 1.26), or replace the key and certificate by hand. Later renewals reuse the new key again.
+3. The relay reloads the pair and logs `TLS key changed: SPKI pin <old> -> <new>`; `/.well-known` publishes the new pin at once.
+
+The TLS key is separate from the relay's Ed25519 **signing** key (`relay_key`), which signs moderation events and is what clients trust for them. A TLS rotation does not touch it.
 
 ### WebSocket
 
@@ -65,12 +102,12 @@ openssl req -x509 -newkey ed25519 -nodes -days 365 -subj "/CN=chat.home.example"
 ```sh
 cd relay
 docker build -t sc2-relay .
-cp config/selfhost.env relay.env   # edit it; mount certs at ./certs
+cp config/official.env relay.env   # or selfhost.env; edit it (see TLS above)
 docker compose up -d
 docker compose exec relay python -m sc2_relay.admin status
 ```
 
-The image runs as an unprivileged user and keeps everything persistent in the `/data` volume. It exposes 7778, 7777 and 8080. The admin API stays on 127.0.0.1:7780 *inside* the container and is not published. The compose file drops all capabilities and uses a read-only root filesystem. *(The Docker files were not built during development, because no Docker engine was available.)*
+The image runs as an unprivileged user with the fixed UID/GID 10001 and keeps everything persistent in the `/data` volume. It exposes 7778, 7777 and 8080. The admin API stays on 127.0.0.1:7780 *inside* the container and is not published. The compose file drops all capabilities and uses a read-only root filesystem. *(The Docker files, including the certbot sidecar, were not built or run against Let's Encrypt during development, because no Docker engine or public host was available. The deploy hook and the relay's reload path are exercised by `tests/test_tls_reload.py`.)*
 
 ## HTTP surface (`SC2_HTTP_PORT`, default 8080)
 
@@ -128,7 +165,9 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_BIND` | `0.0.0.0` | Listen address for TLS, plain and HTTP. |
 | `SC2_TLS_CERT`, `SC2_TLS_KEY` | empty | PEM certificate and key. Both set enables `chats://`. |
 | `SC2_TLS_PORT` | `7778` | `chats://` port. |
-| `SC2_ACME_DOMAIN` | empty | Reserved. Logs a warning, because ACME is not implemented; use certbot or Caddy. |
+| `SC2_ACME_DOMAIN` | empty | Let's Encrypt domain. The relay then reads `$SC2_ACME_CERT_DIR/fullchain.pem` and `privkey.pem` (unless `SC2_TLS_CERT/KEY` are set) and waits for them on first start. The certbot sidecar also reads `SC2_ACME_EMAIL`, `SC2_ACME_STAGING`, `SC2_ACME_WEBROOT` and `SC2_ACME_RENEW_INTERVAL`. |
+| `SC2_ACME_CERT_DIR` | `/certs` | Where certbot's deploy hook puts the pair. |
+| `SC2_TLS_RELOAD_INTERVAL` | `60` | Seconds between certificate file checks (0 = off; `SIGHUP` always reloads). |
 | `SC2_PLAIN` | `false` | Enable plain `chat://`. Use on a trusted LAN only, since metadata is visible on the wire. |
 | `SC2_PLAIN_PORT` | `7777` | `chat://` port. Legacy v1 clients use this or the TLS port; the relay recognises v1 by its first line. |
 | `SC2_HTTP_PORT` | `8080` | HTTP port (0 disables). |
@@ -182,29 +221,30 @@ See `config/official.env` and `config/selfhost.env`.
 
 Rate and limit values marked tunable can be changed at runtime with `admin tune`, which persists them in the database. Tunable keys are `admission`, `admit_code`, `post_per_min`, `post_burst`, `ip_post_per_min`, `ip_post_burst`, `room_post_per_min`, the `slow_*` settings, `max_queue`, `max_queue_bytes`, `ttl_days`, `send_per_min`, `send_burst` and `claim_per_min`.
 
-## Wire layouts defined in this phase
+## Wire formats (draft §6.7, §7.0, §7.5, normative since Phase 4b)
 
-The draft leaves these byte layouts to the implementation, so this phase defines them here. They are implemented in `sc2proto/layouts.py`. The C harness in `tests/c/` builds the commit layout independently and checks it against the relay. **They still need owner sign-off and C-core parity.** `||` means concatenation; integers are big-endian; `lp8(x)` is a one-byte length followed by `x`; `n×id16` is a one-byte count followed by raw 16-byte device IDs.
+The three records are fixed-size binary so a device can build and verify them with small fixed buffers; the relay does the heavier bookkeeping. They are implemented in `sc2proto/layouts.py` and `sc2proto/rooms.py` here and in `protocol/sc2/include/sc2_commit.h` and `sc2_mod.h` on the device; both sides are checked against `protocol/sc2/vectors/sc2_vectors.json` (`tests/test_interop_vectors.py`, `tests/test_c_client.py`). `‖` is concatenation; integers are big-endian.
 
-* **Commit (private-room membership)**, signed by an admin's IK:
-  `"SC2-COMMIT\x01" || suite u8 || room16 || prev u32 || epoch u32 || by16 || n×add16 || n×remove16 || flag u8 [|| n×admins16] || members_hash32`
-  * `flag` is 1 when the commit carries a new `admins` list and 0 when the admin list is unchanged.
-  * `members_hash` is the SHA-256 over the sorted raw member IDs, concatenated, after the commit is applied.
-  * Wire lists must be sorted and free of duplicates.
-  * `room.create` for a private room must carry the genesis commit: `prev 0`, `epoch 1`, `by` the creator, the creator in `add` and in `admins`.
-  * The last admin cannot leave.
-* **Moderation event**, signed by the relay key:
-  `"SC2-MOD\x01" || suite u8 || lp8(relay_id) || lp8(room) || action u8 (1 remove, 2 ban) || ref8 (zeros if none) || device16 (zeros if none) || until u64 (0 = indefinite) || seq u64 || ts u64`
-  * The frame is `{"type":"room.mod","room","seq","action","ref"?,"device"?,"until" (ban only),"ts","by":"relay","sig"}`.
-* **Private-room invites**:
-  * An admin derives `invite_key = HMAC-SHA256(secret, "SC2-INVITE\x01" || room16)` and registers it with the new client frame `{"type":"room.invite","room","key","revoke"?}`. Only admins may do this.
-  * A joiner sends `room.join` with `invite = HMAC-SHA256(invite_key, "SC2-JOIN\x01" || joiner16)`.
-  * A valid proof creates a `room.event join_request` for the room's admins. An admin then adds the joiner with a commit. The relay never adds members by itself.
+* **Commit** (private-room membership), 130 bytes, signed as-is by an admin IK:
+  `"SC2-COMMIT\x01" ‖ suite u8 ‖ room16 ‖ epoch u32 ‖ prev32 ‖ by16 ‖ op u8 ‖ target16 ‖ count u8 ‖ roster_hash32`
+  * `op`: 1 create, 2 add, 3 remove, 4 promote, 5 demote, 6 rotate. **One change per commit.**
+  * `epoch` is the new epoch (current + 1, genesis 1); `prev` is the previous commit's ID (`SHA-256(record)`), zero for genesis. The relay accepts only `epoch == current + 1` and `prev == head`, else `409 epoch_conflict` with `epoch` and `head`.
+  * `count` and `roster_hash` describe the roster after the op: SHA-256 over the entries `device16 ‖ role u8` (1 admin, 0 member) sorted by device ID.
+  * Genesis: epoch 1, zero prev, `target == by` = the creating device, count 1. Rotate: zero target. The last admin can be neither removed nor demoted; a room has at most 32 members (`SC2_ROOM_MEMBERS_MAX` or `policy.max` lower it).
+  * Frames: `room.create` (private) `{type, rid, room, kind:"private", [policy], commit, sig}`; C→R `room.commit` `{type, rid, room, commit, sig}`; R→C fan-out `{type, room, seq, commit, sig}`; acks carry `epoch` and `head`, and `room.state` carries `head`. `commit` and `sig` are standard base64.
+* **Moderation event** (public rooms), 122 bytes, signed by the relay key:
+  `"SC2-MOD\x01" ‖ suite u8 ‖ action u8 (1 remove, 2 ban, 3 unban) ‖ room (64, UTF-8, zero padded, 1..63 bytes) ‖ seq u64 ‖ ts u64 ‖ ref8 ‖ device16 ‖ until u64`
+  * `ref` only for remove (else zero); `device` always (the author for remove, the key for ban/unban); `until` only for ban, `0` = indefinite.
+  * Frame, in this field order: `{type:"room.mod", room, seq, action, ts, [ref], device, [until], by:"relay", sig}`; `until` is `null` for an indefinite ban. A removal of several authors' posts emits one event per author.
+* **Invites** (private rooms):
+  * `invite_key = HMAC-SHA-256(secret16, "SC2-INVITE\x01" ‖ room16)`, registered by an admin with `{type:"room.invite", rid, room, key, [revoke:true]}`.
+  * `room.join` carries `invite = HMAC-SHA-256(invite_key, "SC2-JOIN\x01" ‖ joiner16)`; a valid proof is acked with `status:"requested"` and creates `room.event join_request` for the admins, who add the joiner with a commit. The relay never adds members by itself.
+  * The out-of-band code is `"SC2I" ‖ 1 ‖ room16 ‖ secret16 ‖ admin_id16 ‖ admin_ik32 ‖ url_len u8 ‖ url` (86..286 bytes, `admin_id = device_id(admin_ik)`, URL `chat://` or `chats://`), shown as `sc2i:` + base64. The relay never sees it.
 
 ## Security notes
 
 * **Trust model.** The relay is a store-and-forward router. It cannot read DMs or private rooms, and it cannot forge public posts, member commits or other devices' auth. It *can* see metadata: who talks to whom and when, sizes, IPs, room membership. It can also delay or drop traffic, and it signs moderation events that clients attribute to the relay. Run it on a host you trust with that metadata.
-* **Keys.** Protect `relay_key` (mode 0600, back it up offline). `SC2_ADMIN_TOKEN` must be long and random. Keep the admin API on loopback and tunnel to it over SSH if needed.
+* **Keys.** Protect `relay_key` (always 0600, back it up offline). The TLS key lives in the certbot volume or `SC2_TLS_KEY` (0600, owned by the relay user). `SC2_ADMIN_TOKEN` must be long and random. Keep the admin API on loopback and tunnel to it over SSH if needed.
 * **Plain `chat://`.** Content stays end-to-end encrypted and auth is a signature challenge, but metadata and the relay key fingerprint are exposed to the network. Use it on trusted LANs only.
 * **Legacy v1 is plaintext and unauthenticated** apart from an optional shared token. It is kept for existing gateways and never bridged. Disable it (`SC2_LEGACY_V1=false`) once devices are on v2.
 * **Public rooms are public.** Posts are signed plaintext and appear in the web view when enabled. Clients show the PUBLIC label and the first-join notice. `noindex` asks search engines not to index the view but does not enforce it.
@@ -218,13 +258,15 @@ The draft leaves these byte layouts to the implementation, so this phase defines
 | Area | What it covers |
 |---|---|
 | End-to-end DMs | The relay driven by the Python `sc2ref` client (`protocol/sc2/tools/sc2ref.py`). |
-| Private rooms | Commits, removal, size cap, no history, opt-in share, invites. |
+| Private rooms | Commit chain (head/epoch conflicts, roster hash, genesis rules, last admin), removal, size cap, no history, opt-in share, invites. |
 | Public rooms | Signature verify, limits, labels, slow mode. |
 | Admin and bans | Signed removals, key and IP bans. |
 | Legacy v1 | chatd parity, and `426` under the official profile. |
 | Web view | HTML and JSON, `noindex`. |
 | Storage and config | Migrations, configuration. |
 | TLS and WebSocket | TLS and WS transports. |
-| Interop vectors | The C test vectors. |
+| TLS hot reload | `--reuse-key` renewal keeps connections and the pin, key rotation publishes the new pin, broken pairs are skipped, ACME first start, the certbot deploy hook. |
+| Permissions | 0700 data dir, 0600 database/WAL/SHM/key under umask 000, loose modes tightened. |
+| Interop vectors | The C test vectors, including the commit chain and its bad cases, moderation records and frames, and invites. |
 | Fuzz | Raise `SC2_FUZZ_ITER` for longer runs. |
 | C client | `tests/test_c_client.py` compiles a small C harness (`tests/c/`) against the firmware's SC2 engine with the host compiler and runs it against a live relay. It is skipped when gcc is missing. |

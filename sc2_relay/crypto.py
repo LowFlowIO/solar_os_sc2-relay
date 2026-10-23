@@ -42,21 +42,25 @@ class SigningKey:
 
     @classmethod
     def load_or_create(cls, path):
-        """Load the relay seed from path, creating it (mode 0600) on first run."""
+        """Load the relay seed from path, creating it (mode 0600) on first run.
+        An existing key file with a looser mode is tightened to 0600."""
+        from . import fsperm
         try:
             with open(path, "rb") as f:
                 seed = f.read()
+            fsperm.tighten_file(path)
             if len(seed) != 32:
                 raise ValueError("relay key file " + path + " is corrupt (expected 32 bytes)")
             return cls(seed), False
         except FileNotFoundError:
             pass
         d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, exist_ok=True)
+        if d and not os.path.isdir(d):
+            fsperm.private_dir(d)
         seed = os.urandom(32)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, fsperm.FILE_MODE)
         try:
+            os.fchmod(fd, fsperm.FILE_MODE)  # the umask can only narrow the mode; fchmod pins it
             os.write(fd, seed)
             os.fsync(fd)
         finally:

@@ -7,4 +7,4 @@ read-only web view, and the legacy v1 chat protocol in its own namespace.
 SPDX-License-Identifier: MIT
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

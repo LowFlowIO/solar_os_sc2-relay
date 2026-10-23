@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sc2-relay"
-version = "0.4.0"
+version = "0.4.1"
 description = "SolarOS Sealed Chat (SC2) reference relay and the shared sans-IO sc2proto package"
 readme = "README.md"
 requires-python = ">=3.9"
