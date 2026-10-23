@@ -40,18 +40,22 @@ def harness(tmp_path_factory):
         objs.append(o)
     core = sorted(os.path.join(SC2, "src", f) for f in os.listdir(os.path.join(SC2, "src")) if f.endswith(".c"))
     eng = [os.path.join(SVC, "solar_os_sc2_engine.c"), os.path.join(SVC, "solar_os_sc2_selftest.c")]
-    exe = str(out / "sc2_relay_c_client")
-    r = subprocess.run([cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"] + inc +
-                       [os.path.join(HERE, "c", "sc2_relay_c_client.c")] + core + eng + objs + ["-o", exe],
-                       capture_output=True, text=True)
-    assert r.returncode == 0, r.stderr
-    return exe
+    exes = {}
+    for name, extra in (("sc2_relay_c_client", []),
+                        ("sc2_relay_sc2c_client", [os.path.join(SVC, "solar_os_sc2_client.c")])):
+        exe = str(out / name)
+        r = subprocess.run([cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"] + inc +
+                           [os.path.join(HERE, "c", name + ".c")] + extra + core + eng + objs + ["-o", exe],
+                           capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        exes[name] = exe
+    return exes
 
 
 def test_c_engine_against_python_relay(harness):
     async def body():
         async with relay_server(relay_id="relay.c-interop") as srv:
-            proc = await asyncio.create_subprocess_exec(harness, "127.0.0.1", str(srv.ports["plain"]),
+            proc = await asyncio.create_subprocess_exec(harness["sc2_relay_c_client"], "127.0.0.1", str(srv.ports["plain"]),
                                                         "relay.c-interop", stdout=asyncio.subprocess.PIPE,
                                                         stderr=asyncio.subprocess.PIPE)
             out, err = await asyncio.wait_for(proc.communicate(), 60)
@@ -64,4 +68,23 @@ def test_c_engine_against_python_relay(harness):
             dump = "\n".join("\n".join(str(v) for v in row) for t in ("inbox", "room_log")
                              for row in st.all("SELECT * FROM " + t))
             assert "hello from C" not in dump and "sealed room message" not in dump
+    run(body())
+
+
+def test_device_client_against_python_relay(harness):
+    """The sc2-sync client state machine: login, #general, DMs both ways,
+    matching safety numbers, offline DM delivered after a reconnect."""
+    async def body():
+        async with relay_server(relay_id="relay.sc2c") as srv:
+            proc = await asyncio.create_subprocess_exec(harness["sc2_relay_sc2c_client"], "127.0.0.1",
+                                                        str(srv.ports["plain"]), "relay.sc2c",
+                                                        stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(proc.communicate(), 90)
+            assert proc.returncode == 0, out.decode() + err.decode()
+            assert out.decode().strip().endswith("SC2C-RELAY OK")
+            st = srv.relay.store
+            assert st.scalar("SELECT COUNT(*) FROM public_log") == 1
+            dump = "\n".join(str(v) for row in st.all("SELECT * FROM inbox") for v in row)
+            assert "hi bob" not in dump and "while you were away" not in dump
     run(body())
