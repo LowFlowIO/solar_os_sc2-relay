@@ -42,7 +42,8 @@ def harness(tmp_path_factory):
     eng = [os.path.join(SVC, "solar_os_sc2_engine.c"), os.path.join(SVC, "solar_os_sc2_selftest.c")]
     exes = {}
     for name, extra in (("sc2_relay_c_client", []),
-                        ("sc2_relay_sc2c_client", [os.path.join(SVC, "solar_os_sc2_client.c")])):
+                        ("sc2_relay_sc2c_client", [os.path.join(SVC, "solar_os_sc2_client.c")]),
+                        ("sc2_minirelay_server", [])):
         exe = str(out / name)
         r = subprocess.run([cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"] + inc +
                            [os.path.join(HERE, "c", name + ".c")] + extra + core + eng + objs + ["-o", exe],
@@ -199,3 +200,201 @@ def test_device_parses_relay_wellknown(harness):
             out, _ = await asyncio.wait_for(proc.communicate(tampered), 30)
             assert out.decode().startswith("WELLKNOWN ERR")
     run(body())
+
+
+# ---------------- the on-device mini-relay (chatd), host build ----------------
+
+class MiniRelay:
+    """sc2_minirelay_server: the portable mini-relay core behind a TCP loop."""
+
+    def __init__(self, exe, relay_id, admit=None, legacy=True):
+        args = [exe, relay_id, admit or "-"] + ([] if legacy else ["nolegacy"])
+        self.proc = subprocess.Popen(args, stdout=subprocess.PIPE, text=True)
+        head = self.proc.stdout.readline().split()
+        assert head[0] == "PORT", head
+        self.port, self.key, self.size = int(head[1]), head[3], int(head[5])
+
+    def close(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+def _lines(port, frames, want):
+    import json
+    import socket
+    s = socket.create_connection(("127.0.0.1", port), 5)
+    f = s.makefile("rw")
+    out = []
+    for fr in frames:
+        f.write(json.dumps(fr) + "\n")
+        f.flush()
+    for _ in range(want):
+        ln = f.readline()
+        if not ln:
+            break
+        out.append(json.loads(ln))
+    s.close()
+    return out
+
+
+def test_device_client_against_c_minirelay(harness):
+    """The sc2-sync client against the C mini-relay that runs in chatd:
+    login with the relay key proof, prekey bundles, DMs both ways, #general
+    posts, an offline DM stored and delivered after a reconnect."""
+    mr = MiniRelay(harness["sc2_minirelay_server"], "chatd.test")
+    try:
+        env = dict(os.environ, SC2C_NO_PRIVATE="1")
+        r = subprocess.run([harness["sc2_relay_sc2c_client"], "127.0.0.1", str(mr.port), "chatd.test"],
+                           capture_output=True, text=True, timeout=90, env=env)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert r.stdout.strip().endswith("SC2C-RELAY OK")
+        # the relay key it announces is proven at login (pin mode)
+        r = subprocess.run([harness["sc2_relay_sc2c_client"], "--pin", "127.0.0.1", str(mr.port), "chatd.test",
+                            mr.key], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and "PIN READY" in r.stdout, r.stdout + r.stderr
+        import base64
+        r = subprocess.run([harness["sc2_relay_sc2c_client"], "--pin", "127.0.0.1", str(mr.port), "chatd.test",
+                            base64.b64encode(bytes(range(32))).decode()], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and "PIN REFUSED" in r.stdout, r.stdout + r.stderr
+    finally:
+        mr.close()
+
+
+def test_device_failover_to_c_minirelay(harness):
+    """A device's chatd mini-relay as the fallback of a full relay: the
+    same failover run as above (SPK-only X3DH there, the primary's mailbox
+    after the return)."""
+    mr = MiniRelay(harness["sc2_minirelay_server"], "chatd.fallback")
+
+    async def body():
+        async with relay_server(relay_id="relay.primary") as p:
+            proc = await asyncio.create_subprocess_exec(harness["sc2_relay_sc2c_client"], "127.0.0.1",
+                                                        str(p.ports["plain"]), "relay.primary",
+                                                        str(mr.port), "chatd.fallback",
+                                                        stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(proc.communicate(), 120)
+            text = out.decode()
+            assert proc.returncode == 0, text + err.decode()
+            assert "SC2C-MULTI OK" in text and text.strip().endswith("SC2C-RELAY OK")
+    try:
+        run(body())
+    finally:
+        mr.close()
+
+
+class _Conn:
+    def __init__(self, port):
+        import socket
+        self.s = socket.create_connection(("127.0.0.1", port), 5)
+        self.f = self.s.makefile("rw")
+
+    def send(self, fr):
+        import json
+        self.f.write(json.dumps(fr) + "\n")
+        self.f.flush()
+
+    def recv(self):
+        import json
+        ln = self.f.readline()
+        return json.loads(ln) if ln else None
+
+    def ask(self, fr):
+        self.send(fr)
+        return self.recv()
+
+    def close(self):
+        self.s.close()
+
+
+def _login(port, relay_id, seed, admit=None):
+    import base64
+    from sc2proto import layouts
+    from sc2_relay.crypto import SigningKey
+    k = SigningKey(seed)
+    c = _Conn(port)
+    h = {"type": "hello", "v": 2, "proto": "sc2", "suites": [1]}
+    if admit:
+        h["admit"] = admit
+    w = c.ask(h)
+    ch = base64.b64decode(w["challenge"])
+    a = c.ask({"type": "auth", "rid": "a", "ik": base64.b64encode(k.public).decode(),
+               "sig": base64.b64encode(k.sign(layouts.auth_bytes(relay_id, ch, k.public))).decode()})
+    return c, k, a
+
+
+def test_c_minirelay_frames(harness):
+    """Frame-level rules of the mini-relay: v1 hand-off (legacy on by
+    default) or 426, hello first, bad auth signature, admission code,
+    private rooms refused, the public history cap with sync.gap."""
+    import base64
+    import os as _os
+    from sc2proto import layouts
+    exe = harness["sc2_minirelay_server"]
+    rid = "chatd.frames"
+    mr = MiniRelay(exe, rid, admit="letmein")
+    try:
+        assert _lines(mr.port, [{"type": "hello", "user": "old"}], 1) == [{"type": "connected", "text": "v1 legacy"}]
+        got = _lines(mr.port, [{"type": "sync"}], 1)
+        assert got[0]["code"] == 401 and got[0]["err"] == "auth_required"
+        hello = {"type": "hello", "v": 2, "proto": "sc2", "suites": [1], "nonce": base64.b64encode(bytes(16)).decode()}
+        w = _lines(mr.port, [hello], 1)[0]
+        assert w["type"] == "welcome" and w["relay"] == {"id": rid, "key": mr.key}
+        assert w["legacy_v1"] is True and "relay_sig" in w
+        assert w["limits"]["msg"] == 1024 and w["limits"]["queue"] == 12
+        # bad signature, then a new device without the admission code
+        c = _Conn(mr.port)
+        c.ask({"type": "hello", "v": 2, "proto": "sc2"})
+        e = c.ask({"type": "auth", "ik": base64.b64encode(bytes(32)).decode(),
+                   "sig": base64.b64encode(bytes(64)).decode()})
+        assert e["code"] == 401 and e["err"] == "bad_sig"
+        c.close()
+        seed = _os.urandom(32)
+        c, k, a = _login(mr.port, rid, seed)
+        assert a["code"] == 403 and a["err"] == "admit_required"
+        c.close()
+        c, k, a = _login(mr.port, rid, seed, admit="letmein")
+        assert a["type"] == "authed" and a["new"] is True
+        dev = a["device"]
+        e = c.ask({"type": "room.join", "rid": "j", "room": "00" * 16})
+        assert e["code"] == 501 and e["err"] == "not_supported"
+        e = c.ask({"type": "room.join", "rid": "j", "room": "pub:other"})
+        assert e["code"] == 404
+        st = c.ask({"type": "room.join", "rid": "j", "room": "pub:general"})
+        assert st["type"] == "room.state" and st["kind"] == "public" and st["limits"]["msg"] == 1024
+        # history cap: 26 posts, 24 kept
+        for i in range(26):
+            post = {"s": 1, "t": "text", "from": dev, "ik": base64.b64encode(k.public).decode(),
+                    "id": "%016x" % (i + 1), "ts": 1700000000 + i, "name": "t", "body": "post %d" % i}
+            post["sig"] = base64.b64encode(k.sign(layouts.post_signed_bytes(rid, "pub:general", post))).decode()
+            ack = c.ask({"type": "room.post", "rid": "p%d" % i, "room": "pub:general", "post": post})
+            assert ack["type"] == "ack" and ack["seq"] == str(i + 1), ack
+        again = c.ask({"type": "room.post", "rid": "d", "room": "pub:general", "post": post})
+        assert again["seq"] == "26"  # dedup by (from, id)
+        bad = dict(post, id="%016x" % 99, body="forged")
+        e = c.ask({"type": "room.post", "rid": "b", "room": "pub:general", "post": bad})
+        assert e["code"] == 401 and e["err"] == "bad_sig"
+        c.send({"type": "sync", "rid": "y", "inbox": "0", "rooms": {"pub:general": "0"}, "max": 100})
+        gap = c.recv()
+        assert gap["type"] == "sync.gap" and gap["oldest"] == "3"
+        seqs = []
+        while True:
+            fr = c.recv()
+            if fr["type"] == "sync.done":
+                break
+            assert fr["type"] == "room.pub"
+            seqs.append(int(fr["seq"]))
+        assert seqs == list(range(3, 27)) and fr["rooms"] == {"pub:general": "26"} and fr["more"] is False
+        # unknown recipient, DM to self stays within the caps
+        e = c.ask({"type": "keys.claim", "rid": "k", "device": "ab" * 16})
+        assert e["code"] == 404 and e["err"] == "unknown_device"
+        c.close()
+    finally:
+        mr.close()
+    mr = MiniRelay(exe, "chatd.nolegacy", legacy=False)
+    try:
+        got = _lines(mr.port, [{"type": "hello", "user": "old"}], 1)
+        assert got[0]["code"] == 426 and got[0]["err"] == "upgrade_required"
+        assert mr.size < 200 * 1024  # all stores, one PSRAM block
+    finally:
+        mr.close()

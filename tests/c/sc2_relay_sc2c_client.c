@@ -459,7 +459,7 @@ int main(int argc, char **argv)
     submit(&A, SC2C_PUBLIC, "pub:general", "hello #general", 3);
     pump(b_pub, "#general post");
     if (strcmp(B.last_body, "hello #general")) die("post body");
-    private_room();
+    if (getenv("SC2C_NO_PRIVATE") == NULL) private_room(); /* the mini-relay has no private rooms */
 
     /* Offline delivery and reconnect. */
     d_drop(&B);
