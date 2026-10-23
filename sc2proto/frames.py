@@ -1,5 +1,5 @@
 """SC2 v2 frame schemas: validation of client frames and builders for relay
-frames (draft §6). Validators return a new, normalised dict that holds only
+frames. Validators return a new, normalised dict that holds only
 the known fields, so nothing unsigned or unexpected is stored or forwarded.
 Every failure raises ProtocolError.
 

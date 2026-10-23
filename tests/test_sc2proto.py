@@ -1,5 +1,5 @@
 """sc2proto (sans-IO package): codecs, layouts, validators, commit sequencing,
-rate limiting and cursor logic, checked against the Phase 1 vectors.
+rate limiting and cursor logic, checked against the golden vectors.
 
 SPDX-License-Identifier: MIT
 """

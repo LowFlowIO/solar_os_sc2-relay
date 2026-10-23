@@ -3,7 +3,7 @@
 Speaks the NDJSON protocol of src/jobs/solar_os_chatd_job.c so existing
 SolarOS gateway clients keep working against the reference relay. v1
 channels live in their own tables and are never bridged to SC2 v2 rooms in
-either direction (draft §5.3). Enabled by SC2_LEGACY_V1 (default true; the
+either direction. Enabled by SC2_LEGACY_V1 (default true; the
 official profile forces false and answers v1 hello with 426).
 
 SPDX-License-Identifier: MIT

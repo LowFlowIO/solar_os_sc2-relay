@@ -1,15 +1,13 @@
 """SC2-1 binary layouts: signed bytes, AAD headers and hashes.
 
 These are the byte strings that get signed or authenticated. They are built
-with struct, never from JSON, so no canonicalisation is needed (draft §6).
+with struct, never from JSON, so no canonicalisation is needed.
 All integers are big-endian; variable-length fields carry a length prefix.
 
-Layouts taken verbatim from the draft: auth, dk, spk, room header (H), room
-signature, DM header (Hd), public post.
-
-Fixed-size layouts finalised in Phase 4b (draft §6.7, §7.5), chosen so a
-device without PSRAM can build, parse and verify them in a few hundred bytes
-of stack with no JSON lists to buffer:
+Layouts defined here: auth, dk, spk, room header (H), room signature, DM
+header (Hd) and public post, plus the fixed-size records below. Those are
+sized so a device without PSRAM can build, parse and verify them in a few
+hundred bytes of stack with no JSON lists to buffer:
 - commit (130 bytes, signed as-is by the admin's IK; commit ID = SHA-256):
            "SC2-COMMIT\x01" | suite:u8 | room:16 | epoch:u32 | prev:32 | by:16 |
            op:u8 | target:16 | count:u8 | roster_hash:32

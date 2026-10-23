@@ -1,4 +1,4 @@
-"""Limits, rate limiting, retention and cursor logic (draft §6.1, §7.0, §9).
+"""Limits, rate limiting, retention and cursor logic.
 
 All functions take the current time from the caller (sans-IO).
 
@@ -7,11 +7,11 @@ SPDX-License-Identifier: MIT
 
 DAY = 86400
 
-# Values advertised in welcome.limits (draft §6.1).
+# Values advertised in welcome.limits.
 WELCOME_LIMITS = {"line": 16384, "msg": 4096, "rooms": 64, "members": 32, "queue": 500,
                   "queue_bytes": 5242880, "ttl_days": 7}
 
-PUBLIC_BODY_MAX = 1024          # §7.0 / §9
+PUBLIC_BODY_MAX = 1024          # bytes per public post body
 PUBLIC_LOG_MAX = 10000          # posts per public room
 PRIVATE_LOG_MAX = 10000         # messages per private room
 TTL_DAYS = 7

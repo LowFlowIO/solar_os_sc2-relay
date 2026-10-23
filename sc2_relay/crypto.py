@@ -1,8 +1,9 @@
 """Signature checks and the relay key (libsodium through PyNaCl).
 
-Verification uses crypto_sign_open, exactly like the client repo's protocol/sc2/tools/sc2ref.py,
-so the relay accepts and rejects the same signatures as the reference and
-the C core (checked against the ed25519_verify vectors in the tests).
+Verification uses crypto_sign_open, exactly like protocol/sc2/tools/sc2ref.py
+in the SolarOS client repository (LowFlowIO/solar_os), so the relay accepts
+and rejects the same signatures as the reference and the C core (checked
+against the ed25519_verify vectors in the tests).
 
 SPDX-License-Identifier: MIT
 """

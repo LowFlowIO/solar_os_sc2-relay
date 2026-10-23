@@ -1,4 +1,4 @@
-"""SQLite storage with versioned schema migrations (draft §8.1).
+"""SQLite storage with versioned schema migrations.
 
 The relay keeps only what routing needs: public keys, opaque sealed
 envelopes, signed public posts, membership, moderation and ban records.
@@ -77,7 +77,7 @@ MIGRATIONS = [
     """
     CREATE TABLE settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
     """,
-    # 4: fixed-size commit records (Phase 4b): rooms remember the head commit
+    # 4: fixed-size commit records: rooms remember the head commit
     # ID that the next commit's prev must name
     """
     ALTER TABLE rooms ADD COLUMN head TEXT NOT NULL DEFAULT ''

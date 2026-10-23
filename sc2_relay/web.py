@@ -1,5 +1,5 @@
 """HTTP surface: well-known, health, metrics, read-only web view of public
-rooms, the WebSocket endpoint and the operator admin API (draft §8.1, §8.1a).
+rooms, the WebSocket endpoint and the operator admin API.
 
 A deliberately small HTTP/1.1 implementation on asyncio streams: one request
 per connection (Connection: close), bounded headers and bodies, no cookies.

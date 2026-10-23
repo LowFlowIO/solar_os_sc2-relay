@@ -1,4 +1,4 @@
-"""SC2 error codes (draft §6.9) and the exception used across sc2proto.
+"""SC2 error codes and the exception used across sc2proto.
 
 SPDX-License-Identifier: MIT
 """

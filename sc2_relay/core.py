@@ -8,7 +8,7 @@ to other clients.
 
 The relay never sees plaintext of DMs or private rooms: it stores and
 forwards opaque sealed envelopes, checks signatures that bind them to device
-keys, and enforces quotas, ordering and membership routing (draft §2.3, §8).
+keys, and enforces quotas, ordering and membership routing.
 
 SPDX-License-Identifier: MIT
 """

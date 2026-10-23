@@ -1,8 +1,8 @@
 """Host interop test: the C protocol/sc2 core and the SolarOS SC2 engine,
 built with gcc into a small harness, talk to this Python relay over TCP.
 
-The C sources come from the SolarOS client checkout (main + SC2 client
-patches): set SC2_CLIENT_DIR to it (default: a sibling "solar_os" directory
+The C sources come from a checkout of the SolarOS client repository
+(LowFlowIO/solar_os): set SC2_CLIENT_DIR to it (default: a sibling "solar_os" directory
 of this repository, i.e. ../solar_os). Skipped when gcc or the client checkout
 is not available.
 

@@ -1,4 +1,4 @@
-"""Private-room commit sequencing (draft §6.7, §7.3, §7.4).
+"""Private-room commit sequencing.
 
 The relay is the sequencer: it accepts a commit only when it extends the
 current head (epoch = current + 1, prev = head commit ID), the signer is an

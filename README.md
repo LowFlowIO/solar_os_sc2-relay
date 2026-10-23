@@ -1,13 +1,13 @@
 # SC2 reference relay
 
-This repository holds two Python packages for SolarOS Sealed Chat (SC2, protocol draft v2):
+This repository holds two Python packages for SolarOS Sealed Chat (SC2, protocol version 2):
 
 | Package | What it is |
 |---|---|
 | `sc2proto/` | A shared **sans-IO**, pure-Python protocol package. It covers frame codec, validation, canonical signed-byte layouts, error table, room state machine and limit helpers. It only uses `json`, `struct` and `binascii`, plus `hashlib` when present (`sc2proto.layouts.set_sha256()` lets a port without hashlib plug in its own). It does no I/O and no signing, so it can be shared by the relay, the Python test client and future ports. |
 | `sc2_relay/` | The **asyncio reference relay**. It provides v2 NDJSON over TLS (`chats://`, port 7778) and plain TCP (`chat://`, port 7777, off by default), WebSocket at `/sc2`, an HTTP surface (well-known, health, metrics, read-only web view), a loopback admin API with CLI, a chatd-compatible legacy v1 hub, and SQLite storage with migrations. Its only dependency is PyNaCl, used for Ed25519 verify and sign. |
 
-The relay is **isolated from the firmware core**: it is its own repository, separate from the SolarOS client code (device firmware, `protocol/sc2`, `chatd`; paths such as `protocol/sc2/...` below refer to the client repository), imports nothing from it and builds nothing from the C tree. The one exception is the optional C cross test, which compiles the client's C SC2 engine against the relay on the host; it finds the client checkout through `SC2_CLIENT_DIR` (see Tests). The relay is a separate deployable with its own tests.
+The relay is **isolated from the firmware core**: this repository (LowFlowIO/solar_os_sc2-relay) is separate from the SolarOS client repository (LowFlowIO/solar_os: device firmware, `protocol/sc2`, `chatd`; paths such as `protocol/sc2/...` below refer to the client repository), imports nothing from it and builds nothing from the C tree. The one exception is the optional C cross test, which compiles the client's C SC2 engine against the relay on the host; it finds the client checkout through `SC2_CLIENT_DIR` (see Tests). The relay is a separate deployable with its own tests.
 
 ## What the relay does (and does not) see
 
@@ -245,7 +245,7 @@ See `config/official.env` and `config/selfhost.env`.
 
 Rate and limit values marked tunable can be changed at runtime with `admin tune`, which persists them in the database. Tunable keys are `admission`, `admit_code`, `post_per_min`, `post_burst`, `ip_post_per_min`, `ip_post_burst`, `room_post_per_min`, the `slow_*` settings, `max_queue`, `max_queue_bytes`, `ttl_days`, `send_per_min`, `send_burst` and `claim_per_min`.
 
-## Wire formats (draft §6.7, §7.0, §7.5, normative since Phase 4b)
+## Wire formats
 
 The three records are fixed-size binary so a device can build and verify them with small fixed buffers; the relay does the heavier bookkeeping. They are implemented in `sc2proto/layouts.py` and `sc2proto/rooms.py` here and in `protocol/sc2/include/sc2_commit.h` and `sc2_mod.h` on the device; both sides are checked against `protocol/sc2/vectors/sc2_vectors.json` (`tests/test_interop_vectors.py`, `tests/test_c_client.py`). `‖` is concatenation; integers are big-endian.
 
@@ -277,15 +277,15 @@ The three records are fixed-size binary so a device can build and verify them wi
 
 ## Tests
 
-`python -m pytest -q` from the repository root runs the suite. It stands alone: the Python reference client (`tests/vendor/sc2ref.py`) and the golden vectors (`tests/data/sc2_vectors.json`) are vendored copies from the client repository (see `tests/vendor/README.md`). Only the C cross test needs the client checkout and skips cleanly without it:
+`python -m pytest -q` from the repository root runs the suite. It stands alone: the Python reference client (`tests/vendor/sc2ref.py`) and the golden vectors (`tests/data/sc2_vectors.json`) are vendored copies from the SolarOS client repository (LowFlowIO/solar_os; see `tests/vendor/README.md`). Only the C cross test needs the client checkout and skips cleanly without it:
 
 ```sh
 python3 -m venv /path/venv && /path/venv/bin/pip install -r requirements-dev.txt
 /path/venv/bin/python -m pytest -q                        # cross test skipped
-SC2_CLIENT_DIR=/path/to/solar_os_client /path/venv/bin/python -m pytest -q   # cross test runs (needs gcc/cc, or CC=...)
+SC2_CLIENT_DIR=/path/to/solar_os /path/venv/bin/python -m pytest -q   # cross test runs (needs gcc/cc, or CC=...)
 ```
 
-`SC2_CLIENT_DIR` is a checkout of SolarOS main with the SC2 client patches applied; the default is a sibling directory of this repository called `solar_os` (`../solar_os`). It covers:
+`SC2_CLIENT_DIR` is a checkout of the SolarOS client repository (LowFlowIO/solar_os); the default is a sibling directory of this repository called `solar_os` (`../solar_os`). It covers:
 
 | Area | What it covers |
 |---|---|

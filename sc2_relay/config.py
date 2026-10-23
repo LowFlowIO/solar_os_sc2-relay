@@ -1,4 +1,4 @@
-"""Relay configuration from environment variables (draft §8.1).
+"""Relay configuration from environment variables.
 
 Two profiles share one codebase:
 - selfhost (default): legacy v1 on, web view off, mutes allowed.
@@ -147,7 +147,7 @@ class Config:
             "web_page_size": _int(env, "SC2_WEB_PAGE_SIZE", 100, 1, 200),
             "web_rate_per_min": _int(env, "SC2_WEB_RATE_PER_MIN", 120, 1, 100000),
             "mutes": _bool(env, "SC2_MUTES", False),
-            # anti-spam: rate limits and slow mode only (Q5)
+            # anti-spam: rate limits and slow mode only
             "post_per_min": _int(env, "SC2_POST_PER_MIN", 100000, 1, 100000),
             "post_burst": _int(env, "SC2_POST_BURST", 100000, 1, 100000),
             "ip_post_per_min": _int(env, "SC2_IP_POST_PER_MIN", 100000, 1, 100000),
@@ -244,7 +244,7 @@ class Config:
             if self.legacy_v1:
                 raise ConfigError("the official profile is v2-only: SC2_LEGACY_V1 must be false")
             if self.mutes:
-                raise ConfigError("the official profile has no mutes (Q18): SC2_MUTES must be false")
+                raise ConfigError("the official profile has no mutes: SC2_MUTES must be false")
         if len(self.legacy_v1_token.encode()) >= 96:
             raise ConfigError("SC2_LEGACY_V1_TOKEN must be shorter than 96 bytes")
         _hostport(self.admin_listen, "SC2_ADMIN_LISTEN")
