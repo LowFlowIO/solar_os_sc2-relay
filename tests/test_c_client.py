@@ -88,3 +88,28 @@ def test_device_client_against_python_relay(harness):
             dump = "\n".join(str(v) for row in st.all("SELECT * FROM inbox") for v in row)
             assert "hi bob" not in dump and "while you were away" not in dump
     run(body())
+
+
+def test_device_client_failover_to_fallback_relay(harness):
+    """Multi-relay (sc2-sync failover): same identity on a fallback relay,
+    keys published there without one-time prekeys, an SPK-only X3DH from a
+    peer that only knows the fallback, and the primary's mailbox after the
+    return. The fallback never holds any of alice's OPKs."""
+    async def body():
+        async with relay_server(relay_id="relay.primary") as p, relay_server(relay_id="relay.fallback") as f:
+            proc = await asyncio.create_subprocess_exec(harness["sc2_relay_sc2c_client"], "127.0.0.1",
+                                                        str(p.ports["plain"]), "relay.primary",
+                                                        str(f.ports["plain"]), "relay.fallback",
+                                                        stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.PIPE)
+            out, err = await asyncio.wait_for(proc.communicate(), 120)
+            text = out.decode()
+            assert proc.returncode == 0, text + err.decode()
+            assert "SC2C-MULTI OK" in text and text.strip().endswith("SC2C-RELAY OK")
+            assert f.relay.store.scalar("SELECT COUNT(*) FROM devices") == 3
+            # alice and bob published to the fallback without OPKs; only
+            # carol (a primary-style client there) has any
+            owners = {r[0] for r in f.relay.store.all("SELECT DISTINCT device FROM opks")}
+            assert len(owners) == 1
+            assert p.relay.store.scalar("SELECT COUNT(*) FROM devices") == 2
+    run(body())
