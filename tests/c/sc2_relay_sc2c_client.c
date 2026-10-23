@@ -96,7 +96,9 @@ typedef struct {
     sc2e_t e;
     sc2e_identity_info_t info;
     sc2c_t c;
-    int got_dm, got_pub, sent;
+    int got_dm, got_pub, got_priv, sent;
+    char created[SC2_DEVICE_ID_HEX_LEN + 1];
+    char invite[SC2_INVITE_TEXT_MAX];
     int key_notice;
     bool rotated;
     const char *port, *relay;
@@ -123,6 +125,12 @@ static void d_event(void *ctx, const sc2c_event_t *ev)
         snprintf(d->last_from, sizeof(d->last_from), "%s", ev->from);
         if (ev->kind == SC2C_DM) d->got_dm++;
         if (ev->kind == SC2C_PUBLIC) d->got_pub++;
+        if (ev->kind == SC2C_PRIVATE) d->got_priv++;
+        break;
+    case SC2C_EV_CREATED:
+        printf("[%s] created %s\n", d->name, ev->conv);
+        snprintf(d->created, sizeof(d->created), "%s", ev->conv);
+        snprintf(d->invite, sizeof(d->invite), "%s", ev->text);
         break;
     case SC2C_EV_SENT: d->sent++; break;
     case SC2C_EV_FAILED: die("%s: send %u failed: %d %s", d->name, ev->token, ev->code, ev->text ? ev->text : "");
@@ -174,7 +182,7 @@ static void d_client(sdev_t *d, const char *port, const char *relay, bool primar
     d->relay = relay;
     sc2c_host_t h = {d_send, d_event, d_lock, d_unlock, h_alloc, h_release, d_mono, d_wall, d};
     sc2c_config_t cfg = {.tag = "t", .nick = d->name, .expect_relay = relay, .no_opks = !primary,
-                         .relay_key = g_pin};
+                         .relay_key = g_pin, .auto_admit = true, .invite_url = "chat://test.invalid:7777"};
     int rc = sc2c_init(&d->c, &h, &cfg);
     if (rc != SC2_OK) die("sc2c_init: %s", sc2_strerror(rc));
 }
@@ -260,6 +268,43 @@ static void submit(sdev_t *d, sc2c_kind_t kind, const char *target, const char *
 }
 
 static int c_ready(void) { return sc2c_ready(&C.c); }
+
+/* Private room through the client, as sc2-sync drives it: Alice creates it
+ * (auto-admit), Bob joins with the invite text, both post. */
+static char g_room[SC2_DEVICE_ID_HEX_LEN + 1];
+static int a_created(void) { return A.created[0] != '\0'; }
+static int room_state(sdev_t *d, int want)
+{
+    const sc2c_room_t *r = sc2c_room_get(&d->c, g_room);
+    return r != NULL && r->state == want;
+}
+static int a_room_joined(void) { return room_state(&A, SC2C_ROOM_JOINED); }
+static int b_room_joined(void) { return room_state(&B, SC2C_ROOM_JOINED); }
+static int b_priv1(void) { return B.got_priv >= 1; }
+static int a_priv1(void) { return A.got_priv >= 1; }
+static void private_room(void)
+{
+    if (sc2c_room_create(&A.c, g_room) != SC2_OK) die("room create");
+    pump(a_created, "room created");
+    if (strcmp(A.created, g_room) || strncmp(A.invite, SC2_INVITE_TEXT_PREFIX, 5)) die("created event");
+    char again[SC2_INVITE_TEXT_MAX];
+    if (sc2c_room_invite_text(&A.c, g_room, again, sizeof(again)) != SC2_OK || strcmp(again, A.invite))
+        die("invite text again");
+    if (sc2c_room_invite_text(&B.c, g_room, again, sizeof(again)) != SC2_ERR_NOT_FOUND) die("bob is no admin");
+    pump(a_room_joined, "alice in her room");
+    char joined_room[SC2_DEVICE_ID_HEX_LEN + 1];
+    if (sc2c_room_join_invite(&B.c, "sc2i:AAAA", joined_room) == SC2_OK) die("bad invite accepted");
+    if (sc2c_room_join_invite(&B.c, A.invite, joined_room) != SC2_OK || strcmp(joined_room, g_room))
+        die("join with invite");
+    pump(b_room_joined, "bob admitted to the private room");
+    submit(&A, SC2C_PRIVATE, g_room, "private hello", 20);
+    pump(b_priv1, "private post to bob");
+    if (strcmp(B.last_body, "private hello") || strcmp(B.last_from, A.info.device_id)) die("private body/from");
+    submit(&B, SC2C_PRIVATE, g_room, "private reply", 21);
+    pump(a_priv1, "private reply to alice");
+    if (strcmp(A.last_body, "private reply")) die("private reply body");
+    printf("private room %s OK\n", g_room);
+}
 static int a_dm2(void) { return A.got_dm >= 2; }
 static int a_dm3(void) { return A.got_dm >= 3; }
 static int a_dm4(void) { return A.got_dm >= 4; }
@@ -414,6 +459,7 @@ int main(int argc, char **argv)
     submit(&A, SC2C_PUBLIC, "pub:general", "hello #general", 3);
     pump(b_pub, "#general post");
     if (strcmp(B.last_body, "hello #general")) die("post body");
+    private_room();
 
     /* Offline delivery and reconnect. */
     d_drop(&B);

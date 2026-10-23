@@ -87,6 +87,14 @@ def test_device_client_against_python_relay(harness):
             assert st.scalar("SELECT COUNT(*) FROM public_log") == 1
             dump = "\n".join(str(v) for row in st.all("SELECT * FROM inbox") for v in row)
             assert "hi bob" not in dump and "while you were away" not in dump
+            # private room: created with an invite, the joiner admitted
+            # automatically, posts sealed under the room key
+            assert "private room " in out.decode()
+            room = out.decode().split("private room ")[1].split()[0]
+            assert st.scalar("SELECT COUNT(*) FROM members WHERE room=?", (room,)) == 2
+            assert st.scalar("SELECT COUNT(*) FROM invites WHERE room=?", (room,)) == 1
+            logged = "\n".join(str(v) for row in st.all("SELECT * FROM room_log") for v in row)
+            assert "private hello" not in logged and "private reply" not in logged
     run(body())
 
 
