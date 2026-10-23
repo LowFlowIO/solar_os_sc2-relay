@@ -75,6 +75,11 @@ MIGRATIONS = [
     """
     CREATE TABLE settings(k TEXT PRIMARY KEY, v TEXT NOT NULL);
     """,
+    # 4: fixed-size commit records (Phase 4b): rooms remember the head commit
+    # ID that the next commit's prev must name
+    """
+    ALTER TABLE rooms ADD COLUMN head TEXT NOT NULL DEFAULT ''
+    """,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -246,7 +251,9 @@ class Storage:
         return out
 
     def apply_commit(self, room, state, commit, seq, now, added, removed):
-        self.db.execute("UPDATE rooms SET epoch=? WHERE id=?", (state.epoch, room))
+        """Store one accepted commit ({"commit", "sig"} as on the wire) and the
+        resulting roster (members and admin flags) of state."""
+        self.db.execute("UPDATE rooms SET epoch=?, head=? WHERE id=?", (state.epoch, state.head, room))
         self.db.execute("INSERT INTO commits(room, epoch, seq, commit_json, ts) VALUES(?, ?, ?, ?, ?)",
                         (room, state.epoch, seq, dumps(commit), now))
         for d in removed:

@@ -77,7 +77,7 @@ def test_web_view_pages_and_api():
             assert len(api["mods"]) == 1 and api["next"] == api["mods"][0]["seq"] == "7"
             m = api["mods"][0]
             assert m["action"] == "remove" and m["ref"] == posts[1]["id"] and m["by"] == "relay"
-            assert sc2ref.ed_verify(srv.relay.key.public, frames.mod_signed_bytes_from_frame("relay.test", m),
+            assert sc2ref.ed_verify(srv.relay.key.public, frames.mod_signed_bytes_from_frame(m),
                                     sc2ref.unb64(m["sig"]))
             assert "script-src" not in h["content-security-policy"]
             assert h["content-security-policy"].startswith("default-src 'none'")

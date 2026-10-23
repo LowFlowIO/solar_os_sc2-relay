@@ -242,44 +242,15 @@ def validate_post(post, max_body=POST_BODY_WIRE_MAX, max_name=POST_NAME_MAX):
     return out
 
 
-def _id_list(v, field, max_items=ROOM_MEMBERS_MAX, allow_empty=True):
-    if not isinstance(v, list):
-        _bad(field + " must be a list")
-    if len(v) > max_items or (not allow_empty and not v):
-        _bad(field + " has the wrong number of entries")
-    for d in v:
-        device_hex(d, field)
-    for i in range(1, len(v)):
-        if v[i - 1] >= v[i]:
-            _bad(field + " must be sorted and unique")
-    return list(v)
-
-
-def validate_commit(c):
-    c = _obj(c, "commit")
-    out = {
-        "prev": _int(_req(c, "prev"), "prev", 0, U32 - 1),
-        "epoch": _int(_req(c, "epoch"), "epoch", 1),
-        "by": device_hex(_req(c, "by"), "by"),
-        "add": _id_list(c.get("add", []), "add"),
-        "remove": _id_list(c.get("remove", []), "remove"),
-        "members_hash": _req(c, "members_hash"),
-        "sig": _req(c, "sig"),
-    }
-    if out["epoch"] != out["prev"] + 1:
-        _bad("epoch must be prev + 1")
-    if "admins" in c and c["admins"] is not None:
-        out["admins"] = _id_list(c["admins"], "admins", allow_empty=False)
-    b64d(out["members_hash"], 32, "members_hash")
+def validate_commit(f):
+    """The commit fields of room.create (private) and room.commit: the
+    130-byte record and its signature, both base64. Shape rules are checked
+    here; roster rules by rooms.RoomState."""
+    out = {"commit": _req(f, "commit"), "sig": _req(f, "sig")}
+    rec = b64d(out["commit"], layouts.COMMIT_LEN, "commit")
     b64d(out["sig"], 64, "sig")
+    layouts.commit_parse(rec)
     return out
-
-
-def commit_signed_bytes(room, c):
-    ids = lambda lst: [hexd(d, 16) for d in lst]  # noqa: E731
-    return layouts.commit_signed_bytes(
-        hexd(room, 16, "room"), c["prev"], c["epoch"], hexd(c["by"], 16, "by"), ids(c["add"]), ids(c["remove"]),
-        ids(c["admins"]) if "admins" in c else None, b64d(c["members_hash"], 32))
 
 
 # ---------------- client frames ----------------
@@ -380,7 +351,7 @@ def _v_room_create(f):
         out = {"room": private_room(room), "kind": kind}
         pol = _obj(f.get("policy", {}), "policy")
         out["policy"] = {"max": _int(pol.get("max", ROOM_MEMBERS_MAX), "policy.max", 1, ROOM_MEMBERS_MAX)}
-        out["commit"] = validate_commit(_req(f, "commit"))
+        out.update(validate_commit(f))
         return out
     if kind == "public":
         out = {"room": public_room(room), "kind": kind}
@@ -416,7 +387,9 @@ def _v_room_invite(f):
 
 
 def _v_room_commit(f):
-    return {"room": private_room(_req(f, "room")), "commit": validate_commit(_req(f, "commit"))}
+    out = {"room": private_room(_req(f, "room"))}
+    out.update(validate_commit(f))
+    return out
 
 
 def _v_room_send(f):
@@ -498,25 +471,32 @@ def welcome(relay_id, relay_key_b64, challenge_b64, legacy_v1, limits, suite=lay
             "legacy_v1": bool(legacy_v1), "limits": dict(limits)}
 
 
-def mod_frame(relay_id, room, action, seq, ts, sign, ref=None, device=None, until=None):
-    """Relay-signed room.mod. sign(bytes) -> 64-byte signature."""
-    msg = layouts.mod_signed_bytes(relay_id, room, action, hexd(ref, 8, "ref") if ref else None,
-                                   hexd(device, 16, "device") if device else None, until, seq, ts)
-    f = {"type": "room.mod", "room": room, "seq": fmt_seq(seq), "action": action}
-    if ref:
+def mod_frame(room, action, seq, ts, sign, device, ref=None, until=None):
+    """Relay-signed room.mod over the 122-byte record (layouts.mod_record).
+    sign(bytes) -> 64-byte signature. device is the author for remove, the
+    banned device for ban and unban. until: ban only, None = indefinite."""
+    msg = layouts.mod_record(action, room, seq, ts, hexd(ref, 8, "ref") if ref else None,
+                             hexd(device, 16, "device"), until)
+    f = {"type": "room.mod", "room": room, "seq": fmt_seq(seq), "action": action, "ts": ts}
+    if action == "remove":
         f["ref"] = ref
-    if device:
-        f["device"] = device
+    f["device"] = device
     if action == "ban":
-        f["until"] = until
-    f["ts"] = ts
+        f["until"] = until if until else None
     f["by"] = "relay"
     from .codec import b64e
     f["sig"] = b64e(sign(msg))
     return f
 
 
-def mod_signed_bytes_from_frame(relay_id, f):
-    return layouts.mod_signed_bytes(relay_id, f["room"], f["action"], hexd(f["ref"], 8) if f.get("ref") else None,
-                                    hexd(f["device"], 16) if f.get("device") else None, f.get("until"),
-                                    parse_seq(f["seq"]), f["ts"])
+def mod_signed_bytes_from_frame(f):
+    """The record a room.mod frame's signature covers (what a client rebuilds
+    from the flat fields before checking it against the relay key)."""
+    if f.get("by") != "relay":
+        _bad("room.mod must be by relay")
+    until = f.get("until")
+    if until is not None and (f["action"] != "ban" or not isinstance(until, int) or isinstance(until, bool)):
+        _bad("until is an integer and only for ban")
+    return layouts.mod_record(f["action"], f["room"], parse_seq(f["seq"]), f["ts"],
+                              hexd(f["ref"], 8, "ref") if f.get("ref") is not None else None,
+                              hexd(f["device"], 16, "device"), until)

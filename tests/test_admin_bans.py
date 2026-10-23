@@ -17,8 +17,7 @@ ROOM = "pub:general"
 
 
 def relay_verify(srv, f):
-    return sc2ref.ed_verify(srv.relay.key.public, frames.mod_signed_bytes_from_frame("relay.test", f),
-                            b64d(f["sig"]))
+    return sc2ref.ed_verify(srv.relay.key.public, frames.mod_signed_bytes_from_frame(f), b64d(f["sig"]))
 
 
 def test_admin_requires_token_and_loopback():
@@ -29,7 +28,7 @@ def test_admin_requires_token_and_loopback():
             st, b = await admin(srv, "GET", "/admin/status", token="wrong")
             assert st == 401
             st, b = await admin(srv, "GET", "/admin/status")
-            assert st == 200 and b["relay_id"] == "relay.test" and b["schema"] == 3
+            assert st == 200 and b["relay_id"] == "relay.test" and b["schema"] == 4
             sock = srv.servers[-1].sockets[0].getsockname()
             assert sock[0] == "127.0.0.1"
         # the admin API is not served on the public HTTP port
@@ -61,9 +60,12 @@ def test_remove_post_relay_signed():
             assert st == 200 and b == {"removed": 1}
             mod = await ben.conn.expect("room.mod")
             assert mod["action"] == "remove" and mod["ref"] == post["id"] and mod["by"] == "relay"
+            assert mod["device"] == ana.id  # message IDs are per author: the author is signed too
             assert mod["room"] == ROOM and relay_verify(srv, mod)
-            forged = dict(mod, ref="00" * 8)
+            assert set(mod) == {"type", "room", "seq", "action", "ts", "ref", "device", "by", "sig"}
+            forged = dict(mod, ref="11" * 8)
             assert not relay_verify(srv, forged)
+            assert not relay_verify(srv, dict(mod, device=ben.id))
             # removed posts disappear from sync; the signed removal is replayed instead
             items, done = await ben.sync(rooms={ROOM: "0"})
             assert [f["type"] for f in items] == ["room.mod"]
@@ -92,9 +94,11 @@ def test_key_ban_announced_ip_ban_silent_and_expiry():
             until = int(clock()) + 3600
             assert st == 200 and b == {"until": until, "device": bad.id}
             rm = await watcher.conn.expect("room.mod", action="remove")
-            assert rm["ref"] == post["id"] and relay_verify(srv, rm)
+            assert rm["ref"] == post["id"] and rm["device"] == bad.id and relay_verify(srv, rm)
             ban = await watcher.conn.expect("room.mod", action="ban")
             assert ban["device"] == bad.id and ban["until"] == until and relay_verify(srv, ban)
+            assert "ref" not in ban
+            assert not relay_verify(srv, dict(ban, until=until + 1))
             e = await bad.send_post(ROOM, "more spam")
             assert e["code"] == 403 and e["err"] in ("not_member", "banned")
             e = await bad.join(ROOM)
@@ -103,9 +107,7 @@ def test_key_ban_announced_ip_ban_silent_and_expiry():
             assert e["err"] == "banned"
             # bans cover public rooms only: DMs and private rooms keep working
             room = PrivateRoom()
-            g = room.genesis(bad)
-            ack = await bad.conn.request({"type": "room.create", "rid": "c", "room": room.room, "kind": "private",
-                                          "commit": g})
+            ack = await room.create(bad)
             assert ack["type"] == "ack"
             await watcher.publish(3)
             bad.start_session(await bad.claim(watcher.id))
@@ -132,11 +134,21 @@ def test_key_ban_announced_ip_ban_silent_and_expiry():
             st, b = await admin(srv, "POST", "/admin/unban", {"ip": "127.0.0.1"})
             assert b == {"lifted": 1}
             assert (await fresh.join(ROOM))["type"] == "room.state"
-            # lifting a key ban early
+            assert (await watcher.join(ROOM))["type"] == "room.state"  # the IP ban dropped it too
+            # lifting a key ban early is announced like the ban (relay-signed unban)
             await admin(srv, "POST", "/admin/ban", {"device": fresh.id})
             assert (await fresh.send_post(ROOM, "x"))["code"] == 403
-            await admin(srv, "POST", "/admin/unban", {"device": fresh.id})
+            ban = await watcher.conn.expect("room.mod", action="ban")
+            assert ban["until"] is None and relay_verify(srv, ban)  # indefinite
+            st, b = await admin(srv, "POST", "/admin/unban", {"device": fresh.id})
+            assert b == {"lifted": 1}
+            unban = await watcher.conn.expect("room.mod", action="unban")
+            assert unban["device"] == fresh.id and "until" not in unban and "ref" not in unban
+            assert relay_verify(srv, unban)
             assert (await fresh.join(ROOM))["type"] == "room.state"
+            st, b = await admin(srv, "POST", "/admin/unban", {"device": fresh.id})
+            assert b == {"lifted": 0}  # nothing to lift: no event
+            assert not [f for f in await watcher.conn.quiet() if f.get("action") == "unban"]
             st, b = await admin(srv, "POST", "/admin/ban", {"device": fresh.id, "until": 5})
             assert st == 400
     run(body())

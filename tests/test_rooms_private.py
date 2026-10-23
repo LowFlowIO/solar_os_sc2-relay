@@ -1,6 +1,7 @@
-"""Private rooms: genesis and admin-signed commits, invites and join
-requests, ciphertext-only routing, no history for newcomers, removal notices,
-leave rules and the member cap.
+"""Private rooms: genesis and admin-signed fixed-size commits (one change
+each, chained by commit ID), invites and join requests, ciphertext-only
+routing, no history for newcomers, removal notices, leave rules and the
+member cap.
 
 SPDX-License-Identifier: MIT
 """
@@ -10,9 +11,12 @@ import os
 import sc2ref
 from helpers import Device, PrivateRoom, b64e, layouts, relay_server, run
 from sc2proto import b64d
+from sc2proto.rooms import make_commit
 
 
 async def setup_room(port, n_members=1):
+    """Genesis (epoch 1) and then one add commit per extra member, so the
+    room ends at epoch n_members."""
     admin = Device()
     await admin.connect(port)
     others = []
@@ -21,12 +25,17 @@ async def setup_room(port, n_members=1):
         await d.connect(port)
         others.append(d)
     room = PrivateRoom()
-    g = room.genesis(admin, [d.id for d in others])
-    ack = await admin.conn.request({"type": "room.create", "rid": "c", "room": room.room, "kind": "private",
-                                    "policy": {"max": 32}, "commit": g})
-    assert ack["type"] == "ack" and ack["epoch"] == 1, ack
-    room.accept(g)
+    ack = await room.create(admin, {"max": 32})
+    assert ack["type"] == "ack" and ack["epoch"] == 1 and ack["head"] == room.state.head, ack
+    for d in others:
+        ack = await room.change(admin, "add", d.id)
+        assert ack["type"] == "ack", ack
+    assert room.state.epoch == n_members
     return admin, others, room
+
+
+def frame(room, c, rid):
+    return dict({"type": "room.commit", "rid": rid, "room": room.room}, **c)
 
 
 def test_create_send_and_fanout_ciphertext_only():
@@ -35,9 +44,11 @@ def test_create_send_and_fanout_ciphertext_only():
             port = srv.ports["plain"]
             admin, (bob,), room = await setup_room(port, 2)
             commit = await admin.conn.expect("room.commit")
-            assert commit["seq"] == "1" and commit["commit"]["epoch"] == 1
+            assert commit["seq"] == "1" and layouts.commit_parse(b64d(commit["commit"]))["op"] == "create"
+            assert set(commit) == {"type", "room", "seq", "commit", "sig"}
             st = await admin.conn.request({"type": "room.members", "rid": "m", "room": room.room})
-            assert st["type"] == "room.state" and st["kind"] == "private" and st["epoch"] == 1
+            assert st["type"] == "room.state" and st["kind"] == "private" and st["epoch"] == 2
+            assert st["head"] == room.state.head
             assert sorted(st["members"]) == sorted([admin.id, bob.id]) and st["admins"] == [admin.id]
             env = room.seal(admin, {"t": "text", "id": "0123456789abcdef", "body": "secret words", "ts": 1})
             ack = await admin.conn.request({"type": "room.send", "rid": "s", "room": room.room, "env": env})
@@ -59,12 +70,10 @@ def test_create_send_and_fanout_ciphertext_only():
             assert e["code"] == 403
             # sending under an old epoch -> 409 stale_epoch
             old = room.seal(admin, {"t": "text", "body": "old"}, epoch=1)
-            c = room.commit(admin)  # rotation: empty commit, new epoch
-            ack = await admin.conn.request({"type": "room.commit", "rid": "rot", "room": room.room, "commit": c})
-            assert ack["epoch"] == 2
-            room.accept(c)
+            ack = await room.change(admin, "rotate")  # rotation: roster unchanged, new epoch
+            assert ack["epoch"] == 3
             e = await admin.conn.request({"type": "room.send", "rid": "o", "room": room.room, "env": old})
-            assert e["code"] == 409 and e["err"] == "stale_epoch" and e["epoch"] == 2
+            assert e["code"] == 409 and e["err"] == "stale_epoch" and e["epoch"] == 3
             # non-members are refused, unknown rooms are 404
             eve = Device()
             await eve.connect(port)
@@ -84,55 +93,86 @@ def test_commit_rules():
             carol = Device()
             await carol.connect(port)
             # non-admin commit -> 403
-            c = room.commit(bob, add=[carol.id])
-            e = await bob.conn.request({"type": "room.commit", "rid": "1", "room": room.room, "commit": c})
+            e = await bob.conn.request(frame(room, room.commit(bob, "add", carol.id), "1"))
             assert e["code"] == 403
-            # wrong prev -> 409 epoch_conflict with the current epoch
-            c = room.commit(admin, add=[carol.id])
-            c2 = dict(c, prev=5, epoch=6)
-            c2["sig"] = b64e(admin.sign(__import__("sc2proto").frames.commit_signed_bytes(room.room, c2)))
-            e = await admin.conn.request({"type": "room.commit", "rid": "2", "room": room.room, "commit": c2})
-            assert e["code"] == 409 and e["err"] == "epoch_conflict" and e["epoch"] == 1
+            c = room.commit(admin, "add", carol.id)
+            # a commit that does not extend the head -> 409 epoch_conflict with epoch and head
+            ahead = room.state.copy()
+            ahead.epoch += 3
+            rec, sig = make_commit(ahead, admin.id, "add", carol.id, sign=admin.sign)
+            e = await admin.conn.request(frame(room, {"commit": b64e(rec), "sig": b64e(sig)}, "2"))
+            assert e["code"] == 409 and e["err"] == "epoch_conflict" and e["epoch"] == 2
+            assert e["head"] == room.state.head
+            stale = room.state.copy()
+            stale.head = "00" * 32
+            rec, sig = make_commit(stale, admin.id, "add", carol.id, sign=admin.sign)
+            e = await admin.conn.request(frame(room, {"commit": b64e(rec), "sig": b64e(sig)}, "2b"))
+            assert e["code"] == 409 and e["err"] == "epoch_conflict"
             # bad signature -> 401
-            bad = dict(c, sig=b64e(bytes(64)))
-            e = await admin.conn.request({"type": "room.commit", "rid": "3", "room": room.room, "commit": bad})
+            e = await admin.conn.request(frame(room, dict(c, sig=b64e(bytes(64))), "3"))
             assert e["code"] == 401 and e["err"] == "bad_sig"
-            # members_hash must match
-            wrong = dict(c, members_hash=b64e(bytes(32)))
-            e = await admin.conn.request({"type": "room.commit", "rid": "4", "room": room.room, "commit": wrong})
+            # roster_hash and count must match the roster after the change
+            rec = bytearray(b64d(c["commit"]))
+            rec[98] ^= 1
+            e = await admin.conn.request(frame(room, dict(c, commit=b64e(bytes(rec))), "4"))
+            assert e["code"] == 400 and "roster" in e["text"]
+            rec = bytearray(b64d(c["commit"]))
+            rec[97] += 1
+            e = await admin.conn.request(frame(room, dict(c, commit=b64e(bytes(rec))), "4b"))
             assert e["code"] == 400
-            # unsorted lists are not canonical
-            unsorted = dict(c, add=sorted([carol.id, "00" * 16], reverse=True))
-            e = await admin.conn.request({"type": "room.commit", "rid": "5", "room": room.room, "commit": unsorted})
-            assert e["code"] == 400 and "sorted" in e["text"]
+            # malformed records are refused before any roster check
+            for bad in (b64e(b64d(c["commit"])[:-1]), b64e(b"X" + b64d(c["commit"])[1:]), "not base64"):
+                e = await admin.conn.request(frame(room, dict(c, commit=bad), "5"))
+                assert e["code"] == 400
+            # a commit for another room is refused
+            other = PrivateRoom()
+            other.state = room.state.copy()
+            other.state.room = other.room
+            e = await admin.conn.request(frame(room, other.commit(admin, "add", carol.id), "5b"))
+            assert e["code"] == 400 and "another room" in e["text"]
+            # only room.create carries a genesis
+            e = await admin.conn.request(frame(room, room.commit(admin, "create"), "5c"))
+            assert e["code"] == 400
             # adding an unregistered device -> 404
-            ghost = room.commit(admin, add=["ab" * 16])
-            e = await admin.conn.request({"type": "room.commit", "rid": "6", "room": room.room, "commit": ghost})
+            e = await admin.conn.request(frame(room, room.commit(admin, "add", "ab" * 16), "6"))
             assert e["code"] == 404
             # a valid commit goes through; replaying it now conflicts
-            ok = await admin.conn.request({"type": "room.commit", "rid": "7", "room": room.room, "commit": c})
-            assert ok["type"] == "ack" and ok["epoch"] == 2
+            ok = await admin.conn.request(frame(room, c, "7"))
+            assert ok["type"] == "ack" and ok["epoch"] == 3
             room.accept(c)
-            e = await admin.conn.request({"type": "room.commit", "rid": "8", "room": room.room, "commit": c})
-            assert e["code"] == 409 and e["epoch"] == 2
+            assert ok["head"] == room.state.head
+            e = await admin.conn.request(frame(room, c, "8"))
+            assert e["code"] == 409 and e["epoch"] == 3
+            # roster rules: no double add, no remove of non-members, no demote of non-admins
+            for op, tgt in (("add", carol.id), ("remove", "cd" * 16), ("demote", bob.id), ("promote", admin.id)):
+                e = await admin.conn.request(frame(room, room.commit(admin, op, tgt), "r" + op))
+                assert e["code"] == 400, (op, e)
+            # the last admin can be neither removed nor demoted
+            for op in ("remove", "demote"):
+                e = await admin.conn.request(frame(room, room.commit(admin, op, admin.id), "l" + op))
+                assert e["code"] == 400 and "last admin" in e["text"]
             # admin changes are commits; the new admin can then commit
-            p = room.commit(admin, admins=[admin.id, bob.id])
-            assert (await admin.conn.request({"type": "room.commit", "rid": "9", "room": room.room,
-                                              "commit": p}))["epoch"] == 3
-            room.accept(p)
-            r = room.commit(bob, remove=[carol.id])
-            assert (await bob.conn.request({"type": "room.commit", "rid": "10", "room": room.room,
-                                            "commit": r}))["epoch"] == 4
+            assert (await room.change(admin, "promote", bob.id))["epoch"] == 4
+            assert (await room.change(bob, "remove", carol.id))["epoch"] == 5
+            assert (await room.change(bob, "demote", admin.id))["epoch"] == 6
+            st = await bob.conn.request({"type": "room.members", "rid": "m", "room": room.room})
+            assert st["admins"] == [bob.id] and st["epoch"] == 6 and st["head"] == room.state.head
+            e = await admin.conn.request(frame(room, room.commit(admin, "rotate"), "9"))
+            assert e["code"] == 403  # no longer an admin
             # the commit log is stored in order
-            assert [x["epoch"] for x in srv.relay.store.commits(room.room)] == [1, 2, 3, 4]
-            # genesis must be signed by the creator and list the creator as admin
+            assert [x["epoch"] for x in srv.relay.store.commits(room.room)] == [1, 2, 3, 4, 5, 6]
+            # genesis must be signed by the creator
             room2 = PrivateRoom()
             g = room2.genesis(admin)
-            e = await bob.conn.request({"type": "room.create", "rid": "g", "room": room2.room, "kind": "private",
-                                        "commit": g})
+            e = await bob.conn.request(dict({"type": "room.create", "rid": "g", "room": room2.room,
+                                             "kind": "private"}, **g))
             assert e["code"] == 403
-            e = await admin.conn.request({"type": "room.create", "rid": "g2", "room": room.room, "kind": "private",
-                                          "commit": g})
+            # a genesis must be a create; a create must be a genesis
+            e = await admin.conn.request(dict({"type": "room.create", "rid": "g1", "room": room2.room,
+                                               "kind": "private"}, **room2.commit(admin, "rotate")))
+            assert e["code"] == 400
+            e = await admin.conn.request(dict({"type": "room.create", "rid": "g2", "room": room.room,
+                                               "kind": "private"}, **g))
             assert e["code"] == 403  # room exists
     run(body())
 
@@ -167,9 +207,7 @@ def test_invite_join_request_add_and_no_history():
             got = await bob.conn.quiet()
             assert not [f for f in got if f.get("event") == "join_request"]
             # the admin commits the add
-            c = room.commit(admin, add=[carol.id])
-            ack = await admin.conn.request({"type": "room.commit", "rid": "a", "room": room.room, "commit": c})
-            room.accept(c)
+            ack = await room.change(admin, "add", carol.id)
             join_seq = int(ack["seq"])
             ev = await bob.conn.expect("room.event", event="joined")
             assert ev["device"] == carol.id
@@ -199,9 +237,7 @@ def test_remove_notice_and_routing_stops():
             port = srv.ports["plain"]
             admin, (bob, carol), room = await setup_room(port, 3)
             carol.conn.close()
-            c = room.commit(admin, remove=[carol.id])
-            await admin.conn.request({"type": "room.commit", "rid": "r", "room": room.room, "commit": c})
-            room.accept(c)
+            await room.change(admin, "remove", carol.id)
             ev = await bob.conn.expect("room.event", event="removed")
             assert ev["device"] == carol.id
             # carol was offline: the removed notice waits in her inbox
@@ -237,15 +273,12 @@ def test_leave_rules():
             st = await admin.conn.request({"type": "room.members", "rid": "m", "room": room.room})
             assert st["members"] == [admin.id]
             # the admin then commits the matching remove
-            c = room.commit(admin, remove=[bob.id])
-            assert (await admin.conn.request({"type": "room.commit", "rid": "c", "room": room.room,
-                                              "commit": c}))["type"] == "ack"
-            # promote-then-leave works for admins
+            assert (await room.change(admin, "remove", bob.id))["type"] == "ack"
+            # promote-then-leave works for admins (two commits: add, then promote)
             carol = Device()
             await carol.connect(port)
-            room.accept(c)
-            c = room.commit(admin, add=[carol.id], admins=[admin.id, carol.id])
-            await admin.conn.request({"type": "room.commit", "rid": "c2", "room": room.room, "commit": c})
+            assert (await room.change(admin, "add", carol.id))["type"] == "ack"
+            assert (await room.change(admin, "promote", carol.id))["type"] == "ack"
             ack = await admin.conn.request({"type": "room.leave", "rid": "l3", "room": room.room})
             assert ack["type"] == "ack"
     run(body())
@@ -258,8 +291,7 @@ def test_member_cap():
             admin, others, room = await setup_room(port, 4)
             extra = Device()
             await extra.connect(port)
-            c = room.commit(admin, add=[extra.id])
-            e = await admin.conn.request({"type": "room.commit", "rid": "x", "room": room.room, "commit": c})
+            e = await room.change(admin, "add", extra.id)
             assert e["code"] == 403 and "full" in e["text"]
         async with relay_server() as srv:
             # the advertised default cap is 32 members
@@ -267,9 +299,9 @@ def test_member_cap():
             admin, others, room = await setup_room(port, 32)
             extra = Device()
             await extra.connect(port)
-            c = room.commit(admin, add=[extra.id])
-            e = await admin.conn.request({"type": "room.commit", "rid": "y", "room": room.room, "commit": c})
-            assert e["code"] == 403
+            # a 33rd member cannot even be encoded: count is 1..32 in the record
+            e = await room.change(admin, "add", extra.id)
+            assert e["code"] == 400 and "count" in e["text"]
     run(body())
 
 

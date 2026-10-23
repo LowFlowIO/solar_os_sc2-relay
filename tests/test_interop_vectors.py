@@ -115,3 +115,86 @@ def test_c_hello_vector_gets_a_welcome():
             assert list(w) == list(ref)  # same fields in the same order as the C decoder's vector
             assert w["relay"]["id"] == "relay.example" and w["limits"] == ref["limits"]
     run(body())
+
+
+# ---- Phase 4b: commit, moderation and invite records shared with the C core ----
+
+def _commit_verify(members):
+    iks = {m["id"]: bytes.fromhex(m["ik"]) for m in members.values()}
+
+    def verify(dev, msg, sig):
+        ik = iks.get(dev)
+        return ik is not None and crypto.verify(ik, msg, sig)
+    return verify
+
+
+def _verify_with(ik_hex):
+    ik = bytes.fromhex(ik_hex)
+
+    def verify(dev, msg, sig):
+        from sc2proto import layouts
+        return layouts.device_id(ik).hex() == dev and crypto.verify(ik, msg, sig)
+    return verify
+
+
+def test_commit_chain_vectors_through_the_relay_state_machine():
+    import pytest
+    from sc2proto import ProtocolError, layouts
+    from sc2proto.rooms import RoomState
+    c = VEC["commit"]
+    mem = c["members"]
+    verify = _commit_verify(mem)
+    st = RoomState(c["room"], max_members=layouts.ROOM_MEMBERS_MAX)
+    states = [st]
+    for s in c["steps"]:
+        rec, sig = bytes.fromhex(s["rec"]), bytes.fromhex(s["sig"])
+        st, parsed = st.apply(rec, sig, verify, creator=mem["a"]["id"] if st.epoch == 0 else None)
+        assert parsed["op"] == s["op"]
+        assert st.head == s["id"] == layouts.commit_id(rec).hex()
+        assert len(st.roster) == s["count"] and st.roster_hash().hex() == s["roster_hash"]
+        states.append(st)
+    assert st.epoch == c["final_epoch"] and st.head == c["final_head"]
+    for b in c["bad"]:
+        base = states[b["at"]]
+        with pytest.raises(ProtocolError):
+            base.apply(bytes.fromhex(b["rec"]), bytes.fromhex(b["sig"]), _verify_with(b["ik"]),
+                       creator=mem["a"]["id"] if base.epoch == 0 else None)
+        assert base.epoch == b["at"]  # a refused commit leaves the state alone
+
+
+def test_mod_vectors_match_the_relay_signer_and_checker():
+    import pytest
+    from sc2proto import ProtocolError, layouts
+    m = VEC["mod"]
+    seed, pub = bytes.fromhex(m["relay_seed"]), bytes.fromhex(m["relay_pub"])
+    for case in m["cases"]:
+        until = case["until"] or None
+        ref = case["ref"] or None
+        rec = layouts.mod_record(case["action"], case["room"], case["seq"], case["ts"],
+                                 bytes.fromhex(ref) if ref else None, bytes.fromhex(case["device"]), until)
+        assert rec.hex() == case["rec"] and len(rec) == layouts.MOD_LEN
+        f = frames.mod_frame(case["room"], case["action"], case["seq"], case["ts"],
+                             lambda msg: sc2ref.ed_sign(seed, msg), case["device"], ref=ref, until=until)
+        assert sc2ref.dumps(f) == case["frame"]  # byte for byte, field order included
+        parsed = json.loads(case["frame"])
+        assert crypto.verify(pub, frames.mod_signed_bytes_from_frame(parsed), b64d(parsed["sig"]))
+    for b in m["bad_frames"]:
+        f = json.loads(b["frame"])
+        with pytest.raises((ProtocolError, KeyError, TypeError, ValueError)):
+            msg = frames.mod_signed_bytes_from_frame(f)
+            if not crypto.verify(pub, msg, b64d(f["sig"])):
+                raise ValueError("signature")
+            if not isinstance(f["seq"], str):
+                raise TypeError("seq")
+    t = json.loads(m["tampered"])
+    assert not crypto.verify(pub, frames.mod_signed_bytes_from_frame(t), b64d(t["sig"]))
+
+
+def test_invite_vectors_match_the_relay():
+    from sc2proto import layouts
+    i = VEC["invite"]
+    key = layouts.invite_key(bytes.fromhex(i["secret"]), bytes.fromhex(i["room"]))
+    assert key.hex() == i["key"]
+    assert layouts.invite_proof(key, bytes.fromhex(i["joiner"])).hex() == i["proof"]
+    assert layouts.device_id(bytes.fromhex(i["admin_ik"])).hex() == i["admin_id"]
+    assert i["text"].startswith("sc2i:") and b64d(i["text"][5:]).hex() == i["code"]

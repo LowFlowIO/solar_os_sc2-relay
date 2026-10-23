@@ -377,9 +377,9 @@ class AdminHttp:
         if key == ("POST", "/admin/unban"):
             n = 0
             if b.get("device"):
-                n += st.lift_ban("bans", "key", self._device(b["device"]))
+                n += r.mod_unban_key(self._device(b["device"]))  # announced: room.mod unban
             if b.get("ip"):
-                n += st.lift_ban("bans", "ip", str(b["ip"]))
+                n += st.lift_ban("bans", "ip", str(b["ip"]))  # silent, like IP bans
             return json_response({"lifted": n})
         if key == ("GET", "/admin/bans"):
             return json_response({"bans": st.list_bans("bans", now)})

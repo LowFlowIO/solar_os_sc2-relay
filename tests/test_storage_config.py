@@ -23,14 +23,14 @@ def test_migrations_from_v1_schema_keep_data(tmp_path):
     db.commit()
     db.close()
     st = Storage(path)
-    assert st.version() == SCHEMA_VERSION == 3
+    assert st.version() == SCHEMA_VERSION == 4
     assert st.device("ab") is not None
     st.v1_add_channel("general", 0)
     st.set_setting("x", {"a": 1})
     assert st.setting("x") == {"a": 1}
     st.close()
     st = Storage(path)  # idempotent
-    assert st.version() == 3
+    assert st.version() == 4
     st.close()
     db = sqlite3.connect(path)
     db.execute("PRAGMA user_version=99")

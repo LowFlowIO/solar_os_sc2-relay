@@ -306,7 +306,8 @@ class Device:
 
 
 class PrivateRoom:
-    """Client-side bookkeeping for a private room built with sc2ref."""
+    """Client-side bookkeeping for a private room built with sc2ref and the
+    fixed-size commit records (one change per commit)."""
 
     def __init__(self, room_hex=None):
         self.room = room_hex or os.urandom(16).hex()
@@ -314,19 +315,40 @@ class PrivateRoom:
         self.epoch_keys = {}
         self.n = {}
 
-    def genesis(self, admin, others=()):
-        c = make_commit(self.room, self.state, admin.id, add=[admin.id] + list(others), admins=[admin.id],
-                        sign=admin.sign)
-        return c
+    def genesis(self, admin):
+        """{"commit", "sig"} for room.create: the creator is the only member."""
+        return self.commit(admin, "create")
 
-    def commit(self, admin, add=(), remove=(), admins=None):
-        return make_commit(self.room, self.state, admin.id, add=add, remove=remove, admins=admins, sign=admin.sign)
+    def commit(self, admin, op="rotate", target=None, state=None):
+        """{"commit", "sig"} for one change on top of the local state."""
+        rec, sig = make_commit(state or self.state, admin.id, op, target, sign=admin.sign)
+        return {"commit": b64e(rec), "sig": b64e(sig)}
 
     def accept(self, c):
-        members = (self.state.members - set(c["remove"])) | set(c["add"])
-        admins = set(c["admins"]) if "admins" in c else self.state.admins - set(c["remove"])
-        self.state = RoomState(self.room, c["epoch"], members, admins)
-        self.epoch_keys[c["epoch"]] = os.urandom(32)
+        rec = b64d(c["commit"])
+        parsed = layouts.commit_parse(rec)
+        creator = hexe(parsed["by"]) if parsed["op"] == "create" else None
+        self.state, _ = self.state.apply(rec, b64d(c["sig"]), lambda *a: True, creator=creator)
+        self.epoch_keys[self.state.epoch] = os.urandom(32)
+
+    async def create(self, admin, policy=None):
+        g = self.genesis(admin)
+        f = {"type": "room.create", "rid": admin.rid(), "room": self.room, "kind": "private"}
+        if policy is not None:
+            f["policy"] = policy
+        f.update(g)
+        ack = await admin.conn.request(f)
+        if ack.get("type") == "ack":
+            self.accept(g)
+        return ack
+
+    async def change(self, admin, op, target=None):
+        """Send one commit; accept it locally when the relay acks it."""
+        c = self.commit(admin, op, target)
+        ack = await admin.conn.request(dict({"type": "room.commit", "rid": admin.rid(), "room": self.room}, **c))
+        if ack.get("type") == "ack":
+            self.accept(c)
+        return ack
 
     def seal(self, dev, inner, epoch=None):
         e = epoch or self.state.epoch

@@ -6,9 +6,11 @@
  *
  * Flow: hello/welcome/auth for both devices, keys.publish, keys.claim and
  * add_bundle, sealed DMs both ways (X3DH + ratchet) with inbox sync and ack,
- * a private room (genesis commit signed here with the Phase 4 commit
- * layout, epoch key shared over DM, sealed room messages verified by the
- * relay), and a signed public post verified by the relay and by the reader.
+ * a private room built with the protocol/sc2 commit API (genesis, an
+ * invite registered by the admin, bob's invite proof, the admin's add commit
+ * checked by bob from the relay's fan-out, then a rotate), the epoch key
+ * shared over DM, sealed room messages verified by the relay, and a signed
+ * public post verified by the relay and by the reader.
  * Prints "SC2-C-RELAY OK" and exits 0 on success.
  *
  * SPDX-License-Identifier: MIT
@@ -29,6 +31,7 @@
 #include <unistd.h>
 
 #include "sc2_codec.h"
+#include "sc2_commit.h"
 #include "sc2_crypto.h"
 #include "sc2_frame.h"
 #include "sc2_hash.h"
@@ -273,53 +276,37 @@ static void dm(device_t *from, device_t *to, const char *inner, int expect_kind)
     send_line(&to->conn, g_out, n);
 }
 
-/* Phase 4 commit layout (relay/sc2proto/layouts.py commit_signed_bytes). */
-static void genesis_commit(device_t *admin, const char *room_hex, const device_t *other, char *out, size_t cap)
+/* One commit on top of the admin's roster, sent as room.create (genesis) or
+ * room.commit; applied locally once the relay acks it. Returns the record. */
+static void room_commit(device_t *admin, sc2_roster_t *r, uint8_t op, const uint8_t target[16],
+                        uint8_t rec[SC2_COMMIT_LEN])
 {
-    uint8_t room[16], a[16], b[16], msg[256], mh[32], sig[64];
-    const uint8_t *lo, *hi;
-    size_t m = 0;
-    char mh_b64[64], sig_b64[100];
-    size_t blen = 0;
-    CHECK(sc2_hex_decode(room, 16, room_hex, 32), "room hex");
-    CHECK(sc2_hex_decode(a, 16, admin->e.self_hex, 32), "id hex");
-    CHECK(sc2_hex_decode(b, 16, other->e.self_hex, 32), "id hex");
-    lo = memcmp(a, b, 16) < 0 ? a : b;
-    hi = lo == a ? b : a;
-    uint8_t both[32];
-    memcpy(both, lo, 16);
-    memcpy(both + 16, hi, 16);
-    CHECK(sc2_sha256(mh, both, 32), "members hash");
-    memcpy(msg + m, "SC2-COMMIT\x01", 11);
-    m += 11;
-    msg[m++] = 1; /* suite */
-    memcpy(msg + m, room, 16);
-    m += 16;
-    msg[m++] = 0, msg[m++] = 0, msg[m++] = 0, msg[m++] = 0; /* prev 0 */
-    msg[m++] = 0, msg[m++] = 0, msg[m++] = 0, msg[m++] = 1; /* epoch 1 */
-    memcpy(msg + m, a, 16);                                 /* by */
-    m += 16;
-    msg[m++] = 2; /* add: sorted */
-    memcpy(msg + m, both, 32);
-    m += 32;
-    msg[m++] = 0; /* remove: none */
-    msg[m++] = 1; /* admins listed */
-    msg[m++] = 1;
-    memcpy(msg + m, a, 16);
-    m += 16;
-    memcpy(msg + m, mh, 32);
-    m += 32;
-    CHECK(sc2_ed25519_sign(sig, msg, m, admin->e.id.ik_seed), "commit sign");
-    CHECK(sc2_b64_encode(mh_b64, sizeof(mh_b64), &blen, mh, 32), "b64");
-    CHECK(sc2_b64_encode(sig_b64, sizeof(sig_b64), &blen, sig, 64), "b64");
-    char lo_hex[33], hi_hex[33];
-    CHECK(sc2_hex_encode(lo_hex, sizeof(lo_hex), lo, 16), "hex");
-    CHECK(sc2_hex_encode(hi_hex, sizeof(hi_hex), hi, 16), "hex");
-    snprintf(out, cap,
-             "{\"type\":\"room.create\",\"rid\":\"c1\",\"room\":\"%s\",\"kind\":\"private\",\"policy\":{\"max\":32},"
-             "\"commit\":{\"prev\":0,\"epoch\":1,\"by\":\"%s\",\"add\":[\"%s\",\"%s\"],\"remove\":[],"
-             "\"admins\":[\"%s\"],\"members_hash\":\"%s\",\"sig\":\"%s\"}}",
-             room_hex, admin->e.self_hex, lo_hex, hi_hex, admin->e.self_hex, mh_b64, sig_b64);
+    sc2_commit_t c;
+    uint8_t by[16], sig[64];
+    size_t n = 0;
+    CHECK(sc2_hex_decode(by, 16, admin->e.self_hex, 32), "id hex");
+    CHECK(sc2_commit_make(&c, r, by, op, target), "commit_make");
+    CHECK(sc2_commit_encode(rec, &c), "commit_encode");
+    CHECK(sc2_commit_sign(sig, rec, admin->e.id.ik_seed), "commit_sign");
+    CHECK(sc2_commit_verify(sig, rec, admin->e.id.ik_pub), "commit_verify");
+    if (op == SC2_COMMIT_CREATE) {
+        CHECK(sc2_frame_room_create_private(g_out, sizeof(g_out), &n, "c1", r->room, rec, sig), "create frame");
+    } else {
+        CHECK(sc2_frame_room_commit(g_out, sizeof(g_out), &n, "c2", r->room, rec, sig), "commit frame");
+    }
+    send_line(&admin->conn, g_out, n);
+    recv_type(&admin->conn, "ack", g_line, sizeof(g_line));
+    char want[32];
+    snprintf(want, sizeof(want), "\"epoch\":%u", (unsigned)c.epoch);
+    if (strstr(g_line, want) == NULL) {
+        die("commit not accepted: %s", g_line);
+    }
+    CHECK(sc2_roster_apply(r, rec), "roster_apply");
+    char head[65];
+    CHECK(sc2_hex_encode(head, sizeof(head), r->head, 32), "hex");
+    if (strstr(g_line, head) == NULL) {
+        die("relay head differs from the C commit ID: %s", g_line);
+    }
 }
 
 int main(int argc, char **argv)
@@ -349,15 +336,54 @@ int main(int argc, char **argv)
     dm(&bob, &alice, "{\"t\":\"text\",\"body\":\"hello back\"}", SC2E_DM_MESSAGE);
     dm(&alice, &bob, "{\"t\":\"text\",\"body\":\"third\"}", SC2E_DM_MESSAGE);
 
-    /* private room: genesis commit, epoch key over DM, sealed messages */
+    /* private room: genesis, invite, join request, add commit, rotate, epoch key over DM */
     char room[SC2_DEVICE_ID_HEX_LEN + 1];
+    uint8_t room_b[16], bob_id[16], rec[SC2_COMMIT_LEN];
     uint32_t epoch = 0;
+    static sc2_roster_t roster;
     CHECK(sc2e_room_create(&alice.e, NULL, room, &epoch), "room_create");
-    genesis_commit(&alice, room, &bob, g_out, sizeof(g_out));
-    send_line(&alice.conn, g_out, strlen(g_out));
+    CHECK(sc2_hex_decode(room_b, 16, room, 32), "room hex");
+    CHECK(sc2_hex_decode(bob_id, 16, bob.e.self_hex, 32), "id hex");
+    sc2_roster_init(&roster, room_b);
+    room_commit(&alice, &roster, SC2_COMMIT_CREATE, NULL, rec);
+    /* invite: the admin registers HMAC(secret, room); bob proves it for his ID */
+    uint8_t secret[SC2_INVITE_SECRET_LEN], ikey[SC2_INVITE_KEY_LEN], proof[32];
+    urandom_fn(NULL, secret, sizeof(secret));
+    CHECK(sc2_invite_key(ikey, secret, room_b), "invite_key");
+    CHECK(sc2_frame_room_invite(g_out, sizeof(g_out), &n, "i1", room_b, ikey, false), "invite frame");
+    send_line(&alice.conn, g_out, n);
     recv_type(&alice.conn, "ack", g_line, sizeof(g_line));
-    if (strstr(g_line, "\"epoch\":1") == NULL) {
-        die("room.create not accepted: %s", g_line);
+    CHECK(sc2_invite_proof(proof, ikey, bob_id), "invite_proof");
+    CHECK(sc2_frame_room_join_private(g_out, sizeof(g_out), &n, "j1", room_b, proof), "join frame");
+    send_line(&bob.conn, g_out, n);
+    recv_type(&bob.conn, "ack", g_line, sizeof(g_line));
+    if (strstr(g_line, "\"status\":\"requested\"") == NULL) {
+        die("join request not accepted: %s", g_line);
+    }
+    recv_type(&alice.conn, "room.event", g_line, sizeof(g_line));
+    if (strstr(g_line, "join_request") == NULL || strstr(g_line, bob.e.self_hex) == NULL) {
+        die("join request not seen by the admin: %s", g_line);
+    }
+    room_commit(&alice, &roster, SC2_COMMIT_ADD, bob_id, rec);
+    /* bob checks the relay's fan-out of the add with the admin's IK */
+    {
+        uint8_t got_room[16], got[SC2_COMMIT_LEN], got_sig[64];
+        uint64_t cseq = 0;
+        sc2_commit_t cc;
+        n = recv_type(&bob.conn, "room.commit", g_line, sizeof(g_line));
+        CHECK(sc2_frame_room_commit_decode(g_line, n, got_room, &cseq, got, got_sig), "commit fan-out");
+        CHECK(sc2_commit_verify(got_sig, got, alice.e.id.ik_pub), "fan-out signature");
+        CHECK(sc2_commit_decode(&cc, got), "commit_decode");
+        if (memcmp(got, rec, SC2_COMMIT_LEN) != 0 || cc.op != SC2_COMMIT_ADD || memcmp(cc.target, bob_id, 16) != 0) {
+            die("fan-out commit differs");
+        }
+    }
+    /* one change per commit: a rotate after the add, then the key goes out */
+    room_commit(&alice, &roster, SC2_COMMIT_ROTATE, NULL, rec);
+    CHECK(sc2e_room_rotate(&alice.e, room, &epoch), "room_rotate");
+    CHECK(sc2e_room_rotate(&alice.e, room, &epoch), "room_rotate");
+    if (epoch != roster.epoch || roster.count != 2) {
+        die("engine epoch %u, roster epoch %u", (unsigned)epoch, (unsigned)roster.epoch);
     }
     CHECK(sc2e_room_share(&alice.e, room, bob.e.self_hex, "s1", g_out, sizeof(g_out), &n), "room_share");
     send_line(&alice.conn, g_out, n);
@@ -365,7 +391,7 @@ int main(int argc, char **argv)
     n = recv_type(&bob.conn, "dm.msg", g_line, sizeof(g_line));
     sc2e_dm_result_t dr;
     CHECK(sc2e_dm_decrypt(&bob.e, g_line, n, &dr, g_pt, sizeof(g_pt), &pl), "epoch key DM");
-    if (dr.kind != SC2E_DM_EPOCH_KEY || dr.epoch != 1 || strcmp(dr.room, room) != 0) {
+    if (dr.kind != SC2E_DM_EPOCH_KEY || dr.epoch != roster.epoch || strcmp(dr.room, room) != 0) {
         die("epoch key DM not consumed");
     }
     const char *rmsg = "{\"t\":\"text\",\"body\":\"sealed room message from C\"}";
@@ -376,7 +402,7 @@ int main(int argc, char **argv)
         n = recv_type(&bob.conn, "room.msg", g_line, sizeof(g_line));
         sc2e_room_result_t rr;
         CHECK(sc2e_room_decrypt(&bob.e, g_line, n, &rr, g_pt, sizeof(g_pt), &pl), "room_decrypt");
-        if (strcmp(g_pt, rmsg) != 0 || rr.n != (uint32_t)i || rr.epoch != 1) {
+        if (strcmp(g_pt, rmsg) != 0 || rr.n != (uint32_t)i || rr.epoch != roster.epoch) {
             die("room message mismatch");
         }
     }

@@ -7,15 +7,18 @@ All integers are big-endian; variable-length fields carry a length prefix.
 Layouts taken verbatim from the draft: auth, dk, spk, room header (H), room
 signature, DM header (Hd), public post.
 
-Layouts defined in Phase 4 (the draft names the frames but leaves the
-encoding open; the C core does not implement them yet):
-- commit:  "SC2-COMMIT\\x01" | suite:u8 | room:16 | prev:u32 | epoch:u32 |
-           by:16 | n:u8 add[16]* | n:u8 remove[16]* | flag:u8 [n:u8 admins[16]*] |
-           members_hash:32
-- mod:     "SC2-MOD\\x01" | suite:u8 | len:u8 relay_id | len:u8 room | action:u8 |
-           ref:8 | device:16 | until:u64 | seq:u64 | ts:u64
-- invite:  invite_key = HMAC(invite_secret, "SC2-INVITE\\x01" | room:16)
-           proof      = HMAC(invite_key, "SC2-JOIN\\x01" | joiner:16)
+Fixed-size layouts finalised in Phase 4b (draft §6.7, §7.5), chosen so a
+device without PSRAM can build, parse and verify them in a few hundred bytes
+of stack with no JSON lists to buffer:
+- commit (130 bytes, signed as-is by the admin's IK; commit ID = SHA-256):
+           "SC2-COMMIT\x01" | suite:u8 | room:16 | epoch:u32 | prev:32 | by:16 |
+           op:u8 | target:16 | count:u8 | roster_hash:32
+           roster_hash = SHA-256 over sorted (device:16 | role:u8) entries
+- mod (122 bytes, signed by the relay key):
+           "SC2-MOD\x01" | suite:u8 | action:u8 | room:64 (zero padded) |
+           seq:u64 | ts:u64 | ref:8 | device:16 | until:u64
+- invite:  invite_key = HMAC(invite_secret, "SC2-INVITE\x01" | room:16)
+           proof      = HMAC(invite_key, "SC2-JOIN\x01" | joiner:16)
 
 SHA-256 comes from hashlib when present (CPython and most MicroPython
 ports). Callers on a port without it pass their own with set_sha256().
@@ -41,7 +44,17 @@ L_INVITE = b"SC2-INVITE\x01"
 L_JOIN = b"SC2-JOIN\x01"
 
 POST_TYPES = {"text": 1, "del": 2}
-MOD_ACTIONS = {"remove": 1, "ban": 2}
+MOD_ACTIONS = {"remove": 1, "ban": 2, "unban": 3}
+COMMIT_OPS = {"create": 1, "add": 2, "remove": 3, "promote": 4, "demote": 5, "rotate": 6}
+COMMIT_OP_NAMES = {v: k for k, v in COMMIT_OPS.items()}
+COMMIT_LEN = 130
+MOD_LEN = 122
+MOD_ROOM_MAX = 63
+ROOM_MEMBERS_MAX = 32
+ROLE_MEMBER = 0
+ROLE_ADMIN = 1
+ZERO16 = bytes(16)
+ZERO32 = bytes(32)
 
 try:
     import hashlib as _hashlib
@@ -149,40 +162,66 @@ def post_signed_bytes(relay_id, room, post):
                               post["ts"], post["t"], post["name"], post["body"], ref)
 
 
-def members_hash(member_ids):
-    """SHA-256 over the sorted raw 16-byte member IDs, concatenated."""
-    ids = sorted(bytes(m) for m in member_ids)
-    return sha256(b"".join(ids))
+def roster_hash(roster):
+    """SHA-256 over the sorted (device:16 | role:u8) entries. roster maps raw
+    16-byte device IDs to ROLE_ADMIN or ROLE_MEMBER."""
+    return sha256(b"".join(bytes(d) + bytes([roster[d]]) for d in sorted(bytes(x) for x in roster)))
 
 
-def _id_list(ids, field):
-    if len(ids) > 255:
-        raise ProtocolError(400, "bad_request", field + " list too long")
-    return bytes([len(ids)]) + b"".join(bytes(i) for i in ids)
+def commit_record(room, epoch, prev, by, op, target, count, rhash, suite=SUITE):
+    """The 130-byte commit record. op is a name from COMMIT_OPS."""
+    if op not in COMMIT_OPS:
+        raise ProtocolError(400, "bad_request", "unknown commit op")
+    rec = (L_COMMIT + bytes([suite]) + bytes(room) + struct.pack(">I", epoch) + bytes(prev) + bytes(by) +
+           bytes([COMMIT_OPS[op]]) + bytes(target) + bytes([count]) + bytes(rhash))
+    if len(rec) != COMMIT_LEN:
+        raise ProtocolError(400, "bad_request", "commit field sizes")
+    return rec
 
 
-def commit_signed_bytes(room, prev, epoch, by, add, remove, admins, mhash, suite=SUITE):
-    """Commit signed bytes. add/remove/admins are lists of raw 16-byte IDs in
-    the order they appear on the wire (canonical frames sort them); admins
-    None means "admin list unchanged"."""
-    out = (L_COMMIT + bytes([suite]) + bytes(room) + struct.pack(">II", prev, epoch) + bytes(by) +
-           _id_list(add, "add") + _id_list(remove, "remove"))
-    if admins is None:
-        out += b"\x00"
-    else:
-        out += b"\x01" + _id_list(admins, "admins")
-    return out + bytes(mhash)
+def commit_parse(rec):
+    """Parse and shape-check a commit record (no roster rules). Returns a dict
+    with raw bytes for room/prev/by/target/hash."""
+    rec = bytes(rec)
+    if len(rec) != COMMIT_LEN or rec[:11] != L_COMMIT or rec[11] != SUITE:
+        raise ProtocolError(400, "bad_request", "malformed commit record")
+    if rec[80] not in COMMIT_OP_NAMES:
+        raise ProtocolError(400, "bad_request", "unknown commit op")
+    c = {"room": rec[12:28], "epoch": struct.unpack(">I", rec[28:32])[0], "prev": rec[32:64], "by": rec[64:80],
+         "op": COMMIT_OP_NAMES[rec[80]], "target": rec[81:97], "count": rec[97], "hash": rec[98:130]}
+    if not 1 <= c["count"] <= ROOM_MEMBERS_MAX or c["epoch"] == 0 or c["by"] == ZERO16:
+        raise ProtocolError(400, "bad_request", "commit count, epoch or signer out of range")
+    if c["op"] == "create":
+        if c["epoch"] != 1 or c["count"] != 1 or c["prev"] != ZERO32 or c["target"] != c["by"]:
+            raise ProtocolError(400, "bad_request", "genesis must be epoch 1, zero prev, target = by, count 1")
+    elif c["epoch"] == 1:
+        raise ProtocolError(400, "bad_request", "only a genesis commit may have epoch 1")
+    elif (c["op"] == "rotate") != (c["target"] == ZERO16):
+        raise ProtocolError(400, "bad_request", "rotate has a zero target; other ops need one")
+    return c
 
 
-def mod_signed_bytes(relay_id, room, action, ref, device, until, seq, ts, suite=SUITE):
-    """Relay-signed moderation event. ref is 8 raw bytes or None, device is 16
-    raw bytes or None, until is a unix time or None (indefinite -> 0)."""
+def commit_id(rec):
+    return sha256(rec)
+
+
+def mod_record(action, room, seq, ts, ref=None, device=None, until=None, suite=SUITE):
+    """The 122-byte relay-signed moderation record. ref is 8 raw bytes (remove
+    only), device 16 raw bytes (always), until a unix time (ban only; None or
+    0 = indefinite)."""
     if action not in MOD_ACTIONS:
         raise ProtocolError(400, "bad_request", "unknown moderation action")
-    return (L_MOD + bytes([suite]) + _lp8(relay_id.encode(), "relay id") + _lp8(room.encode(), "room") +
-            bytes([MOD_ACTIONS[action]]) + (bytes(ref) if ref is not None else bytes(8)) +
-            (bytes(device) if device is not None else bytes(16)) +
-            struct.pack(">QQQ", 0 if until is None else until, seq, ts))
+    r = room.encode()
+    if not 0 < len(r) <= MOD_ROOM_MAX or b"\x00" in r:
+        raise ProtocolError(400, "bad_request", "room name length")
+    if device is None or bytes(device) == ZERO16:
+        raise ProtocolError(400, "bad_request", "moderation events name a device")
+    if (action == "remove") != (ref is not None and bytes(ref) != bytes(8)):
+        raise ProtocolError(400, "bad_request", "ref is required for remove and only for remove")
+    if action != "ban" and until:
+        raise ProtocolError(400, "bad_request", "until is only for ban")
+    return (L_MOD + bytes([suite, MOD_ACTIONS[action]]) + r + bytes(64 - len(r)) + struct.pack(">QQ", seq, ts) +
+            (bytes(ref) if ref is not None else bytes(8)) + bytes(device) + struct.pack(">Q", until or 0))
 
 
 def invite_key(invite_secret, room):

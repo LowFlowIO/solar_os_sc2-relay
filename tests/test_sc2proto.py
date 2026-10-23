@@ -162,59 +162,107 @@ def _keys():
 def test_commit_sequencing():
     (a, sa, ia), (b, sb, ib), (c, sc, ic), (d, sd, idd) = _keys()
     keys = {a: ia, b: ib, c: ic, d: idd}
+    seeds = {a: sa, b: sb, c: sc, d: sd}
 
     def verify(dev, msg, sig):
         return sc2ref.ed_verify(keys[dev], msg, sig)
 
+    def mk(state, by, op, target=None):
+        return make_commit(state, by, op, target, sign=lambda m: sc2ref.ed_sign(seeds[by], m))
+
     room = "cd" * 16
     st = RoomState(room, max_members=3)
-    g = make_commit(room, st, a, add=[a], admins=[a], sign=lambda m: sc2ref.ed_sign(sa, m))
-    g = frames.validate_commit(g)
-    st1 = st.apply_genesis(a, g, verify)
-    assert st1.epoch == 1 and st1.members == {a} and st1.admins == {a}
+    g = mk(st, a, "create")
+    st1, parsed = st.apply(*g, verify, creator=a)
+    assert parsed["op"] == "create" and st1.epoch == 1 and st1.members == {a} and st1.admins == {a}
+    assert st1.head == hexe(layouts.commit_id(g[0]))
     with pytest.raises(ProtocolError) as e:
-        st1.apply_genesis(a, g, verify)
+        st1.apply(*g, verify, creator=a)
     assert e.value.code == 409
-    c1 = frames.validate_commit(make_commit(room, st1, a, add=[b, c], sign=lambda m: sc2ref.ed_sign(sa, m)))
-    st2 = st1.apply(c1, verify)
-    assert st2.members == {a, b, c} and st2.epoch == 2
-    # linear: replaying c1 against st2 conflicts
     with pytest.raises(ProtocolError) as e:
-        st2.apply(c1, verify)
-    assert e.value.err == "epoch_conflict" and e.value.extra["epoch"] == 2
+        st.apply(*g, verify, creator=b)  # someone else's genesis
+    assert e.value.code == 403
+    with pytest.raises(ProtocolError) as e:
+        st.apply(*g, verify)  # a genesis needs room.create
+    assert e.value.code == 400
+    c1 = mk(st1, a, "add", b)
+    st2, _ = st1.apply(*c1, verify)
+    st3, _ = st2.apply(*mk(st2, a, "add", c), verify)
+    assert st3.members == {a, b, c} and st3.epoch == 3 and st3.roster[b] == 0
+    # linear: replaying c1 against a later state conflicts
+    with pytest.raises(ProtocolError) as e:
+        st3.apply(*c1, verify)
+    assert e.value.err == "epoch_conflict" and e.value.extra["epoch"] == 3 and e.value.extra["head"] == st3.head
+    # a fork (right epoch, wrong prev) conflicts too
+    fork = st2.copy()
+    fork.epoch = 3
+    with pytest.raises(ProtocolError) as e:
+        st3.apply(*mk(fork, a, "rotate"), verify)
+    assert e.value.err == "epoch_conflict"
     # cap
     with pytest.raises(ProtocolError) as e:
-        st2.apply(frames.validate_commit(make_commit(room, st2, a, add=[d], sign=lambda m: sc2ref.ed_sign(sa, m))),
-                  verify)
+        st3.apply(*mk(st3, a, "add", d), verify)
     assert e.value.code == 403
     # non-admin
     with pytest.raises(ProtocolError) as e:
-        st2.apply(frames.validate_commit(make_commit(room, st2, b, remove=[c], sign=lambda m: sc2ref.ed_sign(sb, m))),
-                  verify)
+        st3.apply(*mk(st3, b, "remove", c), verify)
     assert e.value.code == 403
-    # removing the only admin without naming another leaves no admins
+    # the last admin can be neither removed nor demoted
+    for op in ("remove", "demote"):
+        with pytest.raises(ProtocolError) as e:
+            st3.apply(*mk(st3, a, op, a), verify)
+        assert "last admin" in e.value.text
+    # promote, then the old admin can be removed by the new one
+    st4, _ = st3.apply(*mk(st3, a, "promote", b), verify)
+    assert st4.admins == {a, b}
+    st5, _ = st4.apply(*mk(st4, b, "remove", a), verify)
+    assert st5.admins == {b} and st5.members == {b, c}
+    # rotate keeps the roster, moves the epoch and head
+    st6, p6 = st5.apply(*mk(st5, b, "rotate"), verify)
+    assert p6["target"] == bytes(16) and st6.roster == st5.roster and st6.epoch == 6 and st6.head != st5.head
+    # a wrong signature, a wrong roster hash, another room
+    rec, sig = mk(st5, b, "rotate")
+    with pytest.raises(ProtocolError) as e:
+        st5.apply(rec, bytes(64), verify)
+    assert e.value.code == 401
+    bad = bytearray(rec)
+    bad[100] ^= 1
     with pytest.raises(ProtocolError):
-        st2.apply(frames.validate_commit(make_commit(room, st2, a, remove=[a], sign=lambda m: sc2ref.ed_sign(sa, m))),
-                  verify)
-    ok = st2.apply(frames.validate_commit(make_commit(room, st2, a, remove=[a], admins=[b],
-                                                      sign=lambda m: sc2ref.ed_sign(sa, m))), verify)
-    assert ok.admins == {b} and ok.members == {b, c}
-    # signature binds the room
-    other = make_commit("ef" * 16, st2, a, add=[d], sign=lambda m: sc2ref.ed_sign(sa, m))
-    with pytest.raises(ProtocolError):
-        st2.apply(frames.validate_commit(other), verify)
-    # members_hash is SHA-256 over the sorted raw IDs
-    assert st2.members_hash() == layouts.sha256(b"".join(sorted(bytes.fromhex(x) for x in (a, b, c))))
+        st5.apply(bytes(bad), sig, verify)
+    other = st5.copy()
+    other.room = "ef" * 16
+    with pytest.raises(ProtocolError) as e:
+        st5.apply(*mk(other, b, "rotate"), verify)
+    assert "another room" in e.value.text
+    # nothing above changed the states it was applied to
+    assert st3.epoch == 3 and st3.admins == {a}
+    # roster_hash is SHA-256 over sorted (id | role) entries
+    want = layouts.sha256(b"".join(bytes.fromhex(x) + bytes([1 if x == a else 0]) for x in sorted((a, b, c))))
+    assert st3.roster_hash() == want
 
 
 def test_commit_and_mod_layouts_are_stable():
-    room, by = bytes(16), bytes([1]) * 16
-    blob = layouts.commit_signed_bytes(room, 1, 2, by, [bytes([2]) * 16], [], None, bytes(32))
-    assert blob.hex() == ("5343322d434f4d4d495401" "01" + "00" * 16 + "00000001" "00000002" + "01" * 16 +
-                          "01" + "02" * 16 + "00" + "00" + "00" * 32)
-    m = layouts.mod_signed_bytes("r", "pub:g", "ban", None, bytes([3]) * 16, None, 7, 9)
-    assert m.hex() == ("5343322d4d4f4401" "01" "01" "72" "05" + b"pub:g".hex() + "02" + "00" * 8 + "03" * 16 +
-                       "0" * 16 + "%016x" % 7 + "%016x" % 9)
+    room, by, tgt = bytes([7]) * 16, bytes([1]) * 16, bytes([2]) * 16
+    rec = layouts.commit_record(room, 2, bytes([5]) * 32, by, "add", tgt, 2, bytes([9]) * 32)
+    assert len(rec) == 130
+    assert rec.hex() == ("5343322d434f4d4d495401" "01" + "07" * 16 + "00000002" + "05" * 32 + "01" * 16 + "02" +
+                         "02" * 16 + "02" + "09" * 32)
+    assert layouts.commit_parse(rec)["op"] == "add"
+    for bad in (rec[:-1], b"X" + rec[1:], rec[:80] + b"\x07" + rec[81:], rec[:97] + b"\x00" + rec[98:],
+                rec[:97] + b"\x21" + rec[98:], rec[:28] + bytes(4) + rec[32:], rec[:28] + b"\x00\x00\x00\x01" + rec[32:],
+                rec[:81] + bytes(16) + rec[97:], rec[:64] + bytes(16) + rec[80:]):
+        with pytest.raises(ProtocolError):
+            layouts.commit_parse(bad)
+    m = layouts.mod_record("ban", "pub:g", 7, 9, None, bytes([3]) * 16, 11)
+    assert len(m) == 122
+    assert m.hex() == ("5343322d4d4f4401" "01" "02" + b"pub:g".hex() + "00" * 59 + "%016x" % 7 + "%016x" % 9 +
+                       "00" * 8 + "03" * 16 + "%016x" % 11)
+    for kw in ({"action": "remove"}, {"action": "unban", "until": 5}, {"action": "ban", "device": None},
+               {"action": "ban", "ref": bytes([1]) * 8}, {"room": "pub:" + "x" * 60}, {"action": "mute"}):
+        args = dict(action="ban", room="pub:g", seq=1, ts=2, ref=None, device=bytes([3]) * 16, until=None)
+        args.update(kw)
+        with pytest.raises(ProtocolError):
+            layouts.mod_record(**args)
 
 
 def test_invite_proof():

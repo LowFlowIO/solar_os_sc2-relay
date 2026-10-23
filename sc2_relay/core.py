@@ -21,7 +21,7 @@ import time
 import traceback
 
 from sc2proto import (LineBuffer, ProtocolError, b64d, b64e, dumpb, dumps, frames, hexd, hexe, layouts, limits,
-                     loads)
+                     loads, rooms)
 from sc2proto.rooms import RoomState
 
 from . import crypto
@@ -174,6 +174,7 @@ class Relay:
             st["members"] = [m["device"] for m in ms if m["routing"]]
             st["admins"] = [m["device"] for m in ms if m["admin"]]
             st["epoch"] = r["epoch"]
+            st["head"] = r["head"]
         else:
             st["title"] = r["title"]
             st["members_count"] = self.store.public_member_count(room)
@@ -217,14 +218,15 @@ class Relay:
     # ---------------- moderation (admin interface) ----------------
 
     def mod_remove(self, room, ref, dev=None):
-        """Remove a public post by message ID (and optional sender); emits a
-        relay-signed room.mod remove. Returns the number of posts removed."""
+        """Remove a public post by message ID (and optional sender); emits one
+        relay-signed room.mod remove per (author, ID), since message IDs are
+        only unique per author. Returns the number of posts removed."""
         rows = self.store.all("SELECT seq, from_dev FROM public_log WHERE room=? AND id=? AND removed=0" +
                               (" AND from_dev=?" if dev else ""), (room, ref, dev) if dev else (room, ref))
         for r in rows:
             self.store.mark_removed(room, r["seq"])
-        if rows:
-            self._emit_mod(room, "remove", ref=ref)
+        for author in sorted({r["from_dev"] for r in rows}):
+            self._emit_mod(room, "remove", author, ref=ref)
         return len(rows)
 
     def mod_ban_key(self, dev, until, reason, remove_posts=False):
@@ -235,12 +237,21 @@ class Relay:
             if remove_posts:
                 for p in self.store.posts_of(room, dev):
                     self.store.mark_removed(room, p["seq"])
-                    self._emit_mod(room, "remove", ref=p["id"])
-            self._emit_mod(room, "ban", device=dev, until=until)
+                    self._emit_mod(room, "remove", dev, ref=p["id"])
+            self._emit_mod(room, "ban", dev, until=until)
             if self.store.public_member(room, dev) is not None:
                 self.store.public_leave(room, dev)
         for s in list(self.by_device.get(dev, ())):
             s.public_rooms.clear()
+
+    def mod_unban_key(self, dev):
+        """Lift a key ban and announce it (room.mod unban) in every public
+        room. Returns the number of bans lifted (0 or 1)."""
+        n = self.store.lift_ban("bans", "key", dev)
+        if n:
+            for r in self.store.public_rooms():
+                self._emit_mod(r["id"], "unban", dev)
+        return n
 
     def mod_ban_ip(self, ip, until, reason):
         """Silent: IP bans are never announced."""
@@ -249,10 +260,10 @@ class Relay:
             if s.ip == ip:
                 s.public_rooms.clear()
 
-    def _emit_mod(self, room, action, ref=None, device=None, until=None):
+    def _emit_mod(self, room, action, device, ref=None, until=None):
         now = self.now()
         seq = self.store.next_seq(room)
-        f = frames.mod_frame(self.relay_id, room, action, seq, now, self.sign, ref=ref, device=device, until=until)
+        f = frames.mod_frame(room, action, seq, now, self.sign, device, ref=ref, until=until)
         self.store.add_mod(room, seq, action, ref, device, until, now, f)
         self.metrics["mod_events_total"] += 1
         self.fanout_public(room, f)
@@ -567,7 +578,8 @@ class Session:
     def _load_state(self, room, row):
         ms = self.relay.store.members(room)
         pol = json.loads(row["policy"] or "{}")
-        return RoomState(room, row["epoch"], [m["device"] for m in ms], [m["device"] for m in ms if m["admin"]],
+        roster = {m["device"]: (rooms.ADMIN if m["admin"] else rooms.MEMBER) for m in ms}
+        return RoomState(room, row["epoch"], roster, row["head"],
                          min(pol.get("max", self.relay.cfg.room_members_max), self.relay.cfg.room_members_max))
 
     def _check_added(self, devs):
@@ -579,7 +591,7 @@ class Session:
             if r.store.private_room_count(d) >= r.cfg.rooms_per_device:
                 raise ProtocolError(403, "forbidden", "device is in too many rooms", device=d)
 
-    def _commit_apply(self, room, new_state, commit, old_members):
+    def _commit_apply(self, room, new_state, f, old_members):
         r = self.relay
         st = r.store
         now = r.now()
@@ -587,8 +599,9 @@ class Session:
         removed = sorted(old_members - new_state.members)
         with st.tx():
             seq = st.next_seq(room)
-            st.apply_commit(room, new_state, commit, seq, now, added, removed)
-            cf = {"type": "room.commit", "room": room, "seq": frames.fmt_seq(seq), "commit": commit}
+            cf = {"type": "room.commit", "room": room, "seq": frames.fmt_seq(seq), "commit": f["commit"],
+                  "sig": f["sig"]}
+            st.apply_commit(room, new_state, {"commit": f["commit"], "sig": f["sig"]}, seq, now, added, removed)
             st.room_log_add(room, seq, "commit", dumps(cf), now)
         r.fanout_private(room, cf)
         for d in removed:
@@ -614,24 +627,23 @@ class Session:
             return
         if r.store.private_room_count(self.device) >= r.cfg.rooms_per_device:
             raise ProtocolError(403, "forbidden", "too many rooms")
-        state = RoomState(room, 0, (), (), min(f["policy"]["max"], r.cfg.room_members_max))
-        new = state.apply_genesis(self.device, f["commit"], r.verify_device)
-        self._check_added([d for d in new.members if d != self.device])
+        state = RoomState(room, 0, {}, "", min(f["policy"]["max"], r.cfg.room_members_max))
+        new, _ = state.apply(b64d(f["commit"]), b64d(f["sig"]), r.verify_device, creator=self.device)
         with r.store.tx():
             r.store.create_room(room, "private", None, f["policy"], r.now())
-            seq = self._commit_apply(room, new, f["commit"], set())
+            seq = self._commit_apply(room, new, f, set())
         r.metrics["rooms_created_total"] += 1
-        self.send(frames.frame("ack", rid, seq=frames.fmt_seq(seq), epoch=new.epoch))
+        self.send(frames.frame("ack", rid, seq=frames.fmt_seq(seq), epoch=new.epoch, head=new.head))
 
     def h_room_commit(self, f, rid):
         r = self.relay
         room = f["room"]
         row, m = self._private(room)
         state = self._load_state(room, row)
-        new = state.apply(f["commit"], r.verify_device)
+        new, _ = state.apply(b64d(f["commit"]), b64d(f["sig"]), r.verify_device)
         self._check_added(sorted(new.members - state.members))
-        seq = self._commit_apply(room, new, f["commit"], state.members)
-        self.send(frames.frame("ack", rid, seq=frames.fmt_seq(seq), epoch=new.epoch))
+        seq = self._commit_apply(room, new, f, state.members)
+        self.send(frames.frame("ack", rid, seq=frames.fmt_seq(seq), epoch=new.epoch, head=new.head))
 
     def h_room_invite(self, f, rid):
         r = self.relay
