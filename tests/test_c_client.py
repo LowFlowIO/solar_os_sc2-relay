@@ -1,6 +1,10 @@
 """Host interop test: the C protocol/sc2 core and the SolarOS SC2 engine,
 built with gcc into a small harness, talk to this Python relay over TCP.
-Skipped when gcc is not available.
+
+The C sources come from the SolarOS client checkout (main + SC2 client
+patches): set SC2_CLIENT_DIR to it (default: a sibling "solar_os" directory
+of this repository, or of relay/). Skipped when gcc or the client checkout
+is not available.
 
 SPDX-License-Identifier: MIT
 """
@@ -15,13 +19,31 @@ import pytest
 from helpers import relay_server, run
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+
+
+def _client_dir():
+    env = os.environ.get("SC2_CLIENT_DIR")
+    if env:
+        return os.path.abspath(env)
+    for rel in (("..", "..", "..", "solar_os"), ("..", "..", "solar_os")):
+        cand = os.path.abspath(os.path.join(HERE, *rel))
+        if os.path.isdir(os.path.join(cand, "protocol", "sc2")):
+            return cand
+    return os.path.abspath(os.path.join(HERE, "..", "..", "..", "solar_os"))
+
+
+REPO = _client_dir()
 SC2 = os.path.join(REPO, "protocol", "sc2")
 ED = os.path.join(REPO, "src", "vendor", "meshcore", "ed25519")
 WG = os.path.join(REPO, "components", "wireguard_lwip", "src")
 SVC = os.path.join(REPO, "src", "services")
 
-pytestmark = pytest.mark.skipif(shutil.which(os.environ.get("CC", "gcc")) is None, reason="no C compiler")
+_MISSING = os.path.join("src", "services", "solar_os_sc2_client.c")
+pytestmark = [
+    pytest.mark.skipif(shutil.which(os.environ.get("CC", "gcc")) is None, reason="no C compiler"),
+    pytest.mark.skipif(not os.path.isfile(os.path.join(REPO, _MISSING)),
+                       reason="SC2_CLIENT_DIR does not point at a SolarOS client checkout (%s)" % REPO),
+]
 
 
 @pytest.fixture(scope="module")

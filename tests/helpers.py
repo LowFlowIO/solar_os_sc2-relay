@@ -1,4 +1,4 @@
-"""Test clients for the relay. Devices use protocol/sc2/tools/sc2ref.py (the
+"""Test clients for the relay. Devices use the vendored tests/vendor/sc2ref.py (the
 independent Phase 1 reference) for every key, signature and ratchet step.
 
 SPDX-License-Identifier: MIT

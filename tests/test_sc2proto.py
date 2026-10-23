@@ -15,7 +15,7 @@ from sc2proto import LineBuffer, ProtocolError, b64d, b64e, dumps, error_frame, 
 from sc2proto.rooms import RoomState, make_commit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VEC = json.load(open(os.path.join(HERE, "..", "..", "protocol", "sc2", "vectors", "sc2_vectors.json")))
+VEC = json.load(open(os.path.join(HERE, "data", "sc2_vectors.json")))
 PKG = os.path.join(HERE, "..", "sc2proto")
 
 

@@ -18,7 +18,7 @@ from sc2_relay.storage import Storage
 from sc2proto import LineBuffer, ProtocolError, b64d, frames, layouts
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-VEC = json.load(open(os.path.join(HERE, "..", "..", "protocol", "sc2", "vectors", "sc2_vectors.json")))
+VEC = json.load(open(os.path.join(HERE, "data", "sc2_vectors.json")))
 SEEDS = [F for F in VEC["frames"].values() if F.startswith("{")]
 ITER = int(os.environ.get("SC2_FUZZ_ITER", "3000"))
 SEED = int(os.environ.get("SC2_FUZZ_SEED", "0"))  # vary for longer campaigns

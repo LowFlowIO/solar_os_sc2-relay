@@ -7,7 +7,7 @@ This directory holds two Python packages for SolarOS Sealed Chat (SC2, protocol 
 | `sc2proto/` | A shared **sans-IO**, pure-Python protocol package. It covers frame codec, validation, canonical signed-byte layouts, error table, room state machine and limit helpers. It only uses `json`, `struct` and `binascii`, plus `hashlib` when present (`sc2proto.layouts.set_sha256()` lets a port without hashlib plug in its own). It does no I/O and no signing, so it can be shared by the relay, the Python test client and future ports. |
 | `sc2_relay/` | The **asyncio reference relay**. It provides v2 NDJSON over TLS (`chats://`, port 7778) and plain TCP (`chat://`, port 7777, off by default), WebSocket at `/sc2`, an HTTP surface (well-known, health, metrics, read-only web view), a loopback admin API with CLI, a chatd-compatible legacy v1 hub, and SQLite storage with migrations. Its only dependency is PyNaCl, used for Ed25519 verify and sign. |
 
-The relay is **isolated from the firmware core**: nothing outside `relay/` imports it, and it builds nothing from the C tree. The one exception is the optional C interop test, which compiles the C SC2 engine against the relay on the host. `relay/` is the decided location (draft §10.1, Phase 4b): the relay is a separate deployable with its own tests, kept out of the firmware tree.
+The relay is **isolated from the firmware core**: it is shipped separately from the SolarOS client code (device firmware, `protocol/sc2`, `chatd`), imports nothing from it and builds nothing from the C tree. The one exception is the optional C cross test, which compiles the client's C SC2 engine against the relay on the host; it finds the client checkout through `SC2_CLIENT_DIR` (see Tests). The relay is a separate deployable with its own tests.
 
 ## What the relay does (and does not) see
 
@@ -279,11 +279,19 @@ The three records are fixed-size binary so a device can build and verify them wi
 
 ## Tests
 
-`python -m pytest -q` from `relay/` runs the suite. It needs the full repository checkout, because it imports `protocol/sc2/tools/sc2ref.py` and the C vectors and engine sources. It covers:
+`python -m pytest -q` from `relay/` runs the suite. It stands alone: the Python reference client (`tests/vendor/sc2ref.py`) and the golden vectors (`tests/data/sc2_vectors.json`) are vendored copies from the client repository (see `tests/vendor/README.md`). Only the C cross test needs the client checkout and skips cleanly without it:
+
+```sh
+python3 -m venv /path/venv && /path/venv/bin/pip install -r requirements-dev.txt
+cd relay && /path/venv/bin/python -m pytest -q                        # cross test skipped
+SC2_CLIENT_DIR=/path/to/solar_os_client /path/venv/bin/python -m pytest -q   # cross test runs (needs gcc/cc, or CC=...)
+```
+
+`SC2_CLIENT_DIR` is a checkout of SolarOS main with the SC2 client patches applied; the default is a sibling directory called `solar_os`. It covers:
 
 | Area | What it covers |
 |---|---|
-| End-to-end DMs | The relay driven by the Python `sc2ref` client (`protocol/sc2/tools/sc2ref.py`). |
+| End-to-end DMs | The relay driven by the Python `sc2ref` client (`tests/vendor/sc2ref.py`). |
 | Private rooms | Commit chain (head/epoch conflicts, roster hash, genesis rules, last admin), removal, size cap, no history, opt-in share, invites. |
 | Public rooms | Signature verify, limits, labels, slow mode. |
 | Admin and bans | Signed removals, key and IP bans. |
@@ -295,4 +303,4 @@ The three records are fixed-size binary so a device can build and verify them wi
 | Permissions | 0700 data dir, 0600 database/WAL/SHM/key under umask 000, loose modes tightened. |
 | Interop vectors | The C test vectors, including the commit chain and its bad cases, moderation records and frames, and invites. |
 | Fuzz | Raise `SC2_FUZZ_ITER` for longer runs. |
-| C client | `tests/test_c_client.py` compiles a small C harness (`tests/c/`) against the firmware's SC2 engine with the host compiler and runs it against a live relay. It is skipped when gcc is missing. |
+| C client | `tests/test_c_client.py` compiles a small C harness (`tests/c/`) against the SC2 engine and `protocol/sc2` core of the client checkout (`SC2_CLIENT_DIR`) with the host compiler and runs it against a live relay. It is skipped when gcc or the client checkout is missing. |
