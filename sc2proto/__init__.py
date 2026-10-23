@@ -11,9 +11,9 @@ SPDX-License-Identifier: MIT
 
 from .errors import ERRORS, ProtocolError, error_frame
 from .codec import LineBuffer, b64d, b64e, dumpb, dumps, hexd, hexe, is_hex, loads, valid_text
-from . import frames, layouts, limits, rooms
+from . import frames, layouts, limits, relaykey, rooms
 
 __all__ = ["ERRORS", "ProtocolError", "error_frame", "LineBuffer", "b64d", "b64e", "dumpb", "dumps", "hexd",
-           "hexe", "is_hex", "loads", "valid_text", "frames", "layouts", "limits", "rooms"]
+           "hexe", "is_hex", "loads", "valid_text", "frames", "layouts", "limits", "relaykey", "rooms"]
 
 __version__ = "0.4.1"

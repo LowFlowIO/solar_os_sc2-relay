@@ -21,6 +21,14 @@
  * DMs alice on the fallback over the existing session; alice returns to the
  * primary and gets a DM bob left there. Prints "SC2C-MULTI OK" too.
  *
+ *   sc2_relay_sc2c_client --pin <host> <port> <relay_id> <key_b64>
+ *       log in with the relay key pinned; prints "PIN READY",
+ *       "PIN ROTATED <new key>" first if the relay rotated, or
+ *       "PIN REFUSED <reason>" (exit 0 in all three cases).
+ *   sc2_relay_sc2c_client --wellknown < body
+ *       parse and verify a /.well-known/solaros-relay body as the device
+ *       does; prints the descriptor fields or "WELLKNOWN ERR <code>".
+ *
  * SPDX-License-Identifier: MIT
  */
 #define _POSIX_C_SOURCE 200809L
@@ -89,6 +97,8 @@ typedef struct {
     sc2e_identity_info_t info;
     sc2c_t c;
     int got_dm, got_pub, sent;
+    int key_notice;
+    bool rotated;
     const char *port, *relay;
     char last_body[256];
     char last_from[SC2_DEVICE_ID_HEX_LEN + 1];
@@ -118,7 +128,14 @@ static void d_event(void *ctx, const sc2c_event_t *ev)
     case SC2C_EV_FAILED: die("%s: send %u failed: %d %s", d->name, ev->token, ev->code, ev->text ? ev->text : "");
     case SC2C_EV_STATE: printf("[%s] state %s\n", d->name, sc2c_state_name(ev->code)); break;
     case SC2C_EV_ROOM: printf("[%s] room %s state %d\n", d->name, ev->conv, ev->code); break;
-    case SC2C_EV_NOTICE: printf("[%s] notice %d %s\n", d->name, ev->code, ev->text ? ev->text : ""); break;
+    case SC2C_EV_NOTICE:
+        printf("[%s] notice %d %s\n", d->name, ev->code, ev->text ? ev->text : "");
+        if (ev->code == SC2C_NOTICE_RELAY_KEY) {
+            d->key_notice = 1;
+            snprintf(d->last_body, sizeof(d->last_body), "%s", ev->text ? ev->text : "");
+        }
+        break;
+    case SC2C_EV_RELAY_KEY: d->rotated = true; break;
     default: break;
     }
     fflush(stdout);
@@ -149,12 +166,15 @@ static void d_drop(sdev_t *d)
 
 /* (Re)build the client for a relay, as sc2-sync's build_client() does:
  * same engine and store tag, OPKs only on the primary. */
+static const uint8_t *g_pin;
+
 static void d_client(sdev_t *d, const char *port, const char *relay, bool primary)
 {
     d->port = port;
     d->relay = relay;
     sc2c_host_t h = {d_send, d_event, d_lock, d_unlock, h_alloc, h_release, d_mono, d_wall, d};
-    sc2c_config_t cfg = {.tag = "t", .nick = d->name, .expect_relay = relay, .no_opks = !primary};
+    sc2c_config_t cfg = {.tag = "t", .nick = d->name, .expect_relay = relay, .no_opks = !primary,
+                         .relay_key = g_pin};
     int rc = sc2c_init(&d->c, &h, &cfg);
     if (rc != SC2_OK) die("sc2c_init: %s", sc2_strerror(rc));
 }
@@ -300,8 +320,72 @@ static void multi_relay(const sc2e_test_host_t *th, const char *port1, const cha
     printf("SC2C-MULTI OK\n");
 }
 
+static int pin_mode(const sc2e_test_host_t *th, const char *port, const char *relay, const char *key_b64)
+{
+    static uint8_t key[SC2_KEY_LEN];
+    size_t got = 0;
+    if (sc2_b64_decode(key, sizeof(key), &got, key_b64, strlen(key_b64)) != SC2_OK || got != SC2_KEY_LEN) die("key");
+    g_pin = key;
+    d_open(&A, "alice", th, port, relay, true);
+    d_connect(&A);
+    uint64_t end = now_ms() + 20000;
+    while (!sc2c_ready(&A.c)) {
+        if (now_ms() > end) die("timeout");
+        struct pollfd p = {A.fd, POLLIN, 0};
+        poll(&p, 1, 50);
+        if (p.revents & (POLLIN | POLLHUP)) {
+            uint8_t buf[1536];
+            ssize_t n = read(A.fd, buf, sizeof(buf));
+            if (n <= 0) die("relay closed");
+            int rc = sc2c_feed(&A.c, buf, (size_t)n);
+            if (rc == SC2_ERR_AUTH && A.key_notice) {
+                printf("PIN REFUSED %s\n", A.last_body);
+                return 0;
+            }
+            if (rc != SC2_OK) die("feed: %s", sc2_strerror(rc));
+        }
+        sc2c_tick(&A.c);
+    }
+    if (A.rotated) {
+        char out[48];
+        size_t n = 0;
+        sc2_b64_encode(out, sizeof(out), &n, A.c.relay_key, SC2_KEY_LEN);
+        printf("PIN ROTATED %s\n", out);
+    }
+    printf("PIN READY\n");
+    return 0;
+}
+
+static int wellknown_mode(void)
+{
+    static char body[4096];
+    size_t len = fread(body, 1, 1600, stdin); /* the device reads at most 1600 bytes */
+    sc2_desc_t d;
+    int rc = sc2_wellknown_parse(body, len, &d);
+    if (rc != SC2_OK) {
+        printf("WELLKNOWN ERR %d\n", rc);
+        return 0;
+    }
+    char k[48];
+    size_t n = 0;
+    sc2_b64_encode(k, sizeof(k), &n, d.key, SC2_KEY_LEN);
+    printf("id=%s key=%s host=%s port=%u tls=%d pin=%s fallbacks=%u\n", d.relay_id, k, d.host, (unsigned)d.port,
+           d.tls, d.pin, (unsigned)d.fallback_count);
+    for (unsigned i = 0; i < d.fallback_count; i++) {
+        sc2_b64_encode(k, sizeof(k), &n, d.fallback[i].key, SC2_KEY_LEN);
+        printf("fallback=%s %s\n", d.fallback[i].url, k);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--wellknown") == 0) return wellknown_mode();
+    if (argc == 6 && strcmp(argv[1], "--pin") == 0) {
+        g_host = argv[2];
+        sc2e_test_host_t th = {h_alloc, h_release, h_clock, {urandom_fn, NULL}, NULL};
+        return pin_mode(&th, argv[3], argv[4], argv[5]);
+    }
     if (argc != 4 && argc != 6) die("usage: %s host port relay_id [port2 relay_id2]", argv[0]);
     g_host = argv[1];
     sc2e_test_host_t th = {h_alloc, h_release, h_clock, {urandom_fn, NULL}, NULL};

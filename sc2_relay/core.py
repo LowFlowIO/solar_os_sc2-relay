@@ -22,6 +22,7 @@ import traceback
 
 from sc2proto import (LineBuffer, ProtocolError, b64d, b64e, dumpb, dumps, frames, hexd, hexe, layouts, limits,
                      loads, rooms)
+from sc2proto import relaykey
 from sc2proto.rooms import RoomState
 
 from . import crypto
@@ -70,6 +71,8 @@ class Relay:
         self.by_device = collections.defaultdict(set)
         self.metrics = collections.Counter()
         self.tls_pin = None
+        self.ports = {}       # listener ports, set by the server
+        self.rotation = None  # {"from", "sig"}: the previous key's signature over this one
         for k in TUNABLE:
             v = store.setting("tune." + k)
             if v is not None:
@@ -111,8 +114,27 @@ class Relay:
         lim["ttl_days"] = self.cfg.ttl_days
         return lim
 
+    def descriptor(self):
+        """The signed descriptor (sc2proto.relaykey), or None without a
+        client listener. Signed per request: the TLS pin can change."""
+        c = self.config
+        if "tls" in self.ports:
+            port, tls = self.ports["tls"], True
+        elif "plain" in self.ports:
+            port, tls = self.ports["plain"], False
+        else:
+            return None
+        text = relaykey.descriptor_text(
+            self.relay_id, self.key.public, c.public_port or port, tls,
+            host=c.public_host or c.acme_domain or None,
+            pin=self.tls_pin if (tls and c.descriptor_pin) else None,
+            fallbacks=[(u, b64d(k, 32)) for u, k in c.fallbacks], ts=self.now())
+        return {"descriptor": b64e(text), "descriptor_sig": b64e(relaykey.sign_descriptor(self.sign, text))}
+
     def well_known(self):
-        return {
+        # the signed descriptor first: devices read only the start of the body
+        out = self.descriptor() or {}
+        out.update({
             "v": frames.VERSION, "suites": [layouts.SUITE], "relay_id": self.relay_id,
             "relay_key": self.relay_key_b64(), "limits": self.welcome_limits(), "admission": self.cfg.admission,
             "legacy_v1": bool(self.cfg.legacy_v1), "public_rooms": [r["id"] for r in self.store.public_rooms()],
@@ -120,7 +142,10 @@ class Relay:
             "public_limits": {"msg": self.cfg.public_body_max, "per_min": self.cfg.post_per_min,
                               "burst": self.cfg.post_burst},
             "tls_pin": self.tls_pin,
-        }
+        })
+        if self.rotation is not None:
+            out["rotation"] = dict(self.rotation)
+        return out
 
     def verify_device(self, dev, msg, sig):
         d = self.store.device(dev)
@@ -426,8 +451,11 @@ class Session:
             self.challenge = crypto.random_bytes(32)
             self.lines.max_line = frames.LINE_MAX
             self.state = "welcomed"
+            proof = None
+            if f.get("nonce") is not None:
+                proof = b64e(r.sign(relaykey.welcome_bytes(r.relay_id, f["nonce"], self.challenge)))
             self.send(frames.welcome(r.relay_id, r.relay_key_b64(), b64e(self.challenge), r.cfg.legacy_v1,
-                                     r.welcome_limits()))
+                                     r.welcome_limits(), relay_sig_b64=proof, rotation=r.rotation))
             return
         if t == "hello":
             if not r.cfg.legacy_v1 or self.transport == "ws":

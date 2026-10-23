@@ -113,7 +113,7 @@ The image runs as an unprivileged user with the fixed UID/GID 10001 and keeps ev
 
 | Path | |
 |---|---|
-| `/.well-known/solaros-relay` | `v`, `suites`, `relay_id`, relay signing key (`relay_key`), `limits`, `admission`, `legacy_v1`, `public_rooms`, `public_room_create`, `web_view`, `public_limits`, `tls_pin` (null without TLS). |
+| `/.well-known/solaros-relay` | First `descriptor` and `descriptor_sig` (the signed descriptor, below), then `v`, `suites`, `relay_id`, relay signing key (`relay_key`), `limits`, `admission`, `legacy_v1`, `public_rooms`, `public_room_create`, `web_view`, `public_limits`, `tls_pin` (null without TLS), and `rotation` after a key rotation. |
 | `/healthz` | `ok` once the database answers. |
 | `/metrics` | Prometheus text: aggregate gauges (connections, devices, rooms, queue depth) and counters. No identifiers. Disable with `SC2_METRICS=false`, or block it at the proxy. |
 | `/public/`, `/public/<room>?before=<seq>` | HTML web view (if `SC2_WEB_VIEW`). |
@@ -121,6 +121,28 @@ The image runs as an unprivileged user with the fixed UID/GID 10001 and keeps ev
 | `/sc2` | WebSocket transport. |
 
 The web view has its own per-IP rate limit (`SC2_WEB_RATE_PER_MIN`). It sets no cookies and sends a strict CSP with no scripts (`default-src 'none'`), plus `nosniff` and `no-referrer`. All post text is HTML-escaped.
+
+### Signed descriptor and the relay key
+
+SolarOS adds a relay by domain (`messages add sc2 NAME DOMAIN`). It fetches `https://DOMAIN/.well-known/solaros-relay` with the CA bundle and host name checks only; there is no plain-HTTP or unverified fallback. Serve that path over HTTPS on port 443 with a CA certificate, for example with the Caddy front end in `docker-compose.yml`. The device verifies `descriptor_sig` over the descriptor with the key the descriptor names, pins that key in its profile, and from then on requires the relay to prove it at every login. The relay does this by signing the `nonce` from `hello` in `welcome.relay_sig`. A different key is a hard failure on the device. The byte layouts are in `protocol/sc2/include/sc2_relaykey.h` and `sc2proto/relaykey.py`.
+
+The descriptor is short signed text, re-signed on each request:
+
+```
+sc2-relay 1
+id <SC2_RELAY_ID>
+key <relay key, base64>
+host <SC2_PUBLIC_HOST or SC2_ACME_DOMAIN>     (omitted: the device uses the domain it fetched)
+port <SC2_PUBLIC_PORT or the chats:// port>
+tls 1
+pin sha256/<SPKI>                             (only with SC2_DESCRIPTOR_PIN=true)
+fallback <url> <that relay's key, base64>     (SC2_FALLBACK_RELAYS, at most 3)
+ts <unix seconds>
+```
+
+Devices read only the first 1600 bytes, which is why the descriptor comes first. Leave `SC2_DESCRIPTOR_PIN` off when the `chats://` port has a CA certificate that is renewed with new keys (certbot's default): a pinned device would refuse the next key. Turn it on for a self-signed `chats://` port behind a CA-signed HTTPS front.
+
+Key rotation: run `python -m sc2_relay --rotate-key` (same environment) and restart the relay. The old key signs the new one, and the signature is stored in `relay_key.rotation` and sent in `welcome` and `/.well-known`. A device that pinned the old key checks it and moves its pin. Only one step is followed: after a second rotation, devices that missed the first must re-add the relay. Fallback relays listed by other relays must be updated with the new key. Removals signed by the old key no longer verify against the new one.
 
 ## Admin API and CLI
 
@@ -165,6 +187,10 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_BIND` | `0.0.0.0` | Listen address for TLS, plain and HTTP. |
 | `SC2_TLS_CERT`, `SC2_TLS_KEY` | empty | PEM certificate and key. Both set enables `chats://`. |
 | `SC2_TLS_PORT` | `7778` | `chats://` port. |
+| `SC2_PUBLIC_HOST` | (empty) | Host name in the signed descriptor (default: `SC2_ACME_DOMAIN`, else omitted). |
+| `SC2_PUBLIC_PORT` | `0` | Port in the descriptor when it differs from the listener (NAT, proxy); `0` uses the `chats://` port. |
+| `SC2_DESCRIPTOR_PIN` | `false` | Put the SPKI pin of the `chats://` certificate into the descriptor. |
+| `SC2_FALLBACK_RELAYS` | (empty) | Up to 3 comma-separated `URL KEY` pairs (`chats://host:port[#pin=sha256/...] <relay key b64>`) for the descriptor's fallback list. |
 | `SC2_ACME_DOMAIN` | empty | Let's Encrypt domain. The relay then reads `$SC2_ACME_CERT_DIR/fullchain.pem` and `privkey.pem` (unless `SC2_TLS_CERT/KEY` are set) and waits for them on first start. The certbot sidecar also reads `SC2_ACME_EMAIL`, `SC2_ACME_STAGING`, `SC2_ACME_WEBROOT` and `SC2_ACME_RENEW_INTERVAL`. |
 | `SC2_ACME_CERT_DIR` | `/certs` | Where certbot's deploy hook puts the pair. |
 | `SC2_TLS_RELOAD_INTERVAL` | `60` | Seconds between certificate file checks (0 = off; `SIGHUP` always reloads). |

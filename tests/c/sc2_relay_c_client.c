@@ -215,7 +215,7 @@ static void device_connect(device_t *d, const char *host, const char *port)
     sc2_welcome_t w;
     uint8_t sig[SC2_SIG_LEN];
     conn_open(&d->conn, host, port, d->conn.name);
-    CHECK(sc2_frame_hello(g_out, sizeof(g_out), &n, "solaros-c/phase4", NULL), "hello");
+    CHECK(sc2_frame_hello(g_out, sizeof(g_out), &n, "solaros-c/phase4", NULL, NULL), "hello");
     send_line(&d->conn, g_out, n);
     n = recv_type(&d->conn, "welcome", g_line, sizeof(g_line));
     CHECK(sc2_frame_welcome_decode(g_line, n, &w), "welcome decode");

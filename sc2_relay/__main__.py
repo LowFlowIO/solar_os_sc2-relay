@@ -40,6 +40,8 @@ def main(argv=None):
     ap.add_argument("--env-file", help="read SC2_* settings from this file (environment overrides it)")
     ap.add_argument("--check-config", action="store_true", help="validate the configuration and exit")
     ap.add_argument("--print-config", action="store_true", help="print the effective (non-secret) configuration")
+    ap.add_argument("--rotate-key", action="store_true",
+                    help="replace the relay key, signed by the old one (devices that pinned it follow); then exit")
     args = ap.parse_args(argv)
     env = {}
     if args.env_file:
@@ -52,6 +54,15 @@ def main(argv=None):
         return 2
     logging.basicConfig(level=getattr(logging, config.log_level, logging.INFO),
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if args.rotate_key:
+        from .server import rotate_key
+        try:
+            old, new = rotate_key(config)
+        except (RuntimeError, OSError) as e:
+            print("rotate-key: %s" % e, file=sys.stderr)
+            return 1
+        print("relay key rotated: %s -> %s (restart the relay to use it)" % (old, new))
+        return 0
     if args.print_config or args.check_config:
         print(json.dumps(config.summary(), indent=2, sort_keys=True))
         if args.check_config:

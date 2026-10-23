@@ -11,7 +11,7 @@ SPDX-License-Identifier: MIT
 import os
 import re
 
-from sc2proto import frames, is_hex, limits
+from sc2proto import b64d, frames, is_hex, limits
 
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off", "")
@@ -93,6 +93,11 @@ class Config:
             "data_dir": _str(env, "SC2_DATA_DIR", "/data"),
             "db_path": _str(env, "SC2_DB", ""),
             "relay_id": _str(env, "SC2_RELAY_ID", "localhost"),
+            # signed /.well-known descriptor: public endpoint and fallback relays
+            "public_host": _str(env, "SC2_PUBLIC_HOST", ""),
+            "public_port": _int(env, "SC2_PUBLIC_PORT", 0, 0, 65535),
+            "descriptor_pin": _bool(env, "SC2_DESCRIPTOR_PIN", False),
+            "fallback_relays": _list(env, "SC2_FALLBACK_RELAYS", []),
             "bind": _str(env, "SC2_BIND", "0.0.0.0"),
             # chats:// (TLS) and chat:// (plain) NDJSON listeners
             "tls_cert": _str(env, "SC2_TLS_CERT", ""),
@@ -208,6 +213,22 @@ class Config:
             raise ConfigError("SC2_PUBLIC_ROOM_CREATE must be operator or any")
         if not self.relay_id or len(self.relay_id.encode()) > 255:
             raise ConfigError("SC2_RELAY_ID must be 1..255 bytes")
+        if self.public_host and not re.fullmatch(r"(?=.{1,63}$)[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", self.public_host):
+            raise ConfigError("SC2_PUBLIC_HOST must be a DNS name (at most 63 characters)")
+        self.fallbacks = []
+        if len(self.fallback_relays) > 3:
+            raise ConfigError("SC2_FALLBACK_RELAYS: at most 3 relays")
+        for entry in self.fallback_relays:
+            url, _, key = entry.strip().partition(" ")
+            key = key.strip()
+            if not re.fullmatch(r"chats?://[A-Za-z0-9.-]{1,63}:[0-9]{1,5}(#pin=sha256/[A-Za-z0-9+/=]{44})?", url) \
+                    or len(url) > 127:
+                raise ConfigError("SC2_FALLBACK_RELAYS: %r is not chat(s)://host:port[#pin=sha256/...]" % url)
+            try:
+                b64d(key, 32, "key")
+            except Exception:
+                raise ConfigError("SC2_FALLBACK_RELAYS: each relay needs its key: \"URL RELAY_KEY_B64\"")
+            self.fallbacks.append([url, key])
         if self.acme_domain:
             if not re.fullmatch(r"(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}",
                                 self.acme_domain):

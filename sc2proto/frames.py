@@ -300,6 +300,8 @@ def _v_hello(f):
            "client": _str(f.get("client", ""), "client", CLIENT_MAX)}
     if f.get("admit") is not None:
         out["admit"] = _str(f["admit"], "admit", ADMIT_MAX)
+    if f.get("nonce") is not None:
+        out["nonce"] = b64d(f["nonce"], 16, "nonce")
     return out
 
 
@@ -465,10 +467,19 @@ def frame(t, rid=None, **fields):
     return f
 
 
-def welcome(relay_id, relay_key_b64, challenge_b64, legacy_v1, limits, suite=layouts.SUITE):
-    return {"type": "welcome", "v": VERSION, "proto": PROTO, "suite": suite,
-            "relay": {"id": relay_id, "key": relay_key_b64}, "challenge": challenge_b64,
-            "legacy_v1": bool(legacy_v1), "limits": dict(limits)}
+def welcome(relay_id, relay_key_b64, challenge_b64, legacy_v1, limits, suite=layouts.SUITE, relay_sig_b64=None,
+            rotation=None):
+    """relay_sig_b64: the relay key's signature over the hello nonce
+    (sc2proto.relaykey.welcome_bytes). rotation: {"from": old key b64,
+    "sig": b64}, the old key's signature over the current key."""
+    f = {"type": "welcome", "v": VERSION, "proto": PROTO, "suite": suite,
+         "relay": {"id": relay_id, "key": relay_key_b64}, "challenge": challenge_b64,
+         "legacy_v1": bool(legacy_v1), "limits": dict(limits)}
+    if relay_sig_b64 is not None:
+        f["relay_sig"] = relay_sig_b64
+    if rotation is not None:
+        f["rotation"] = {"from": rotation["from"], "sig": rotation["sig"]}
+    return f
 
 
 def mod_frame(room, action, seq, ts, sign, device, ref=None, until=None):

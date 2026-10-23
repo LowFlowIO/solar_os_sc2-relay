@@ -10,20 +10,65 @@ SPDX-License-Identifier: MIT
 """
 
 import asyncio
+import json
 import logging
 import os
 import ssl
 import struct
 
-from sc2proto import ProtocolError, dumpb
+from sc2proto import ProtocolError, b64d, b64e, dumpb, relaykey
 
-from . import tlsutil
+from . import crypto, tlsutil
 from .core import Relay
 from .crypto import SigningKey
 from .storage import Storage
 from .web import AdminHttp, HttpError, PublicHttp, Response, serve_http, ws_accept_key
 
 log = logging.getLogger("sc2_relay.server")
+
+
+def load_rotation(config, key):
+    """relay_key.rotation, written by --rotate-key: the previous key's
+    signature over the current one, sent in welcome so devices that pinned
+    the old key accept the new one. Ignored (logged) if it does not match."""
+    path = config.key_path + ".rotation"
+    try:
+        with open(path) as f:
+            rot = json.load(f)
+        old = b64d(rot["from"], 32, "from")
+        sig = b64d(rot["sig"], 64, "sig")
+    except FileNotFoundError:
+        return None
+    except (ValueError, KeyError, TypeError, ProtocolError) as e:
+        log.warning("ignoring %s: %s", path, e)
+        return None
+    if not crypto.verify(old, relaykey.rotation_bytes(config.relay_id, old, key.public), sig):
+        log.warning("ignoring %s: not a rotation to the current key for relay id %s", path, config.relay_id)
+        return None
+    return {"from": rot["from"], "sig": rot["sig"]}
+
+
+def rotate_key(config):
+    """Replace the relay key; the old key signs the new one (one step).
+    Returns (old_b64, new_b64)."""
+    old, created = SigningKey.load_or_create(config.key_path)
+    if created:
+        raise RuntimeError("no relay key existed; created one instead of rotating")
+    seed = os.urandom(32)
+    new = SigningKey(seed)
+    sig = old.sign(relaykey.rotation_bytes(config.relay_id, old.public, new.public))
+    rot = {"from": b64e(old.public), "to": b64e(new.public), "sig": b64e(sig)}
+    for path, data in ((config.key_path + ".rotation", (json.dumps(rot) + "\n").encode()), (config.key_path, seed)):
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    return rot["from"], rot["to"]
 
 
 class RelayServer:
@@ -41,6 +86,8 @@ class RelayServer:
         self.relay = Relay(config, store, key, **kw)
         self.servers = []
         self.ports = {}
+        self.relay.ports = self.ports
+        self.relay.rotation = load_rotation(config, key)
         self._tasks = []
         self._conns = set()
         self.ssl = None
