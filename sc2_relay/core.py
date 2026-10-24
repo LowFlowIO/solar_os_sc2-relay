@@ -162,8 +162,15 @@ class Relay:
             s.write_line(line)
 
     def inbox_deliver(self, dev, kind, frame, size=None, dedup=None):
+        """Queue one frame in a device's inbox and push it live. Every inbox
+        item counts against SC2_MAX_QUEUE / SC2_MAX_QUEUE_BYTES; returns None
+        (nothing stored) when it does not fit."""
         data = dumps(frame)
-        seq = self.store.inbox_add(dev, kind, data, len(data) if size is None else size, self.now(), dedup)
+        size = len(data) if size is None else size
+        n, b = self.store.inbox_stats(dev)
+        if not limits.queue_admit(n, b, size, self.cfg.max_queue, self.cfg.max_queue_bytes):
+            return None
+        seq = self.store.inbox_add(dev, kind, data, size, self.now(), dedup)
         self.push(dev, with_seq(frame, seq))
         return seq
 
@@ -676,12 +683,10 @@ class Session:
             self.send(frames.frame("ack", rid, seq=frames.fmt_seq(seq)))
             return
         msg = {"type": "dm.msg", "env": env}
-        size = len(dumps(msg))
-        n, b = r.store.inbox_stats(to)
-        if not limits.queue_admit(n, b, size, r.cfg.max_queue, r.cfg.max_queue_bytes):
+        seq = r.inbox_deliver(to, "dm", msg, dedup=dedup)
+        if seq is None:
             r.metrics["inbox_full_total"] += 1
             raise ProtocolError(507, "inbox_full", None, to=to)
-        seq = r.inbox_deliver(to, "dm", msg, size, dedup)
         r.metrics["dm_total"] += 1
         self.send(frames.frame("ack", rid, seq=frames.fmt_seq(seq)))
 
@@ -736,10 +741,22 @@ class Session:
             r.push(d, cf)
         for d in added:
             r.room_log_event(room, "joined", d)
+            # a removal notice still waiting from an earlier removal is stale now
+            st.inbox_drop(d, "removed:" + room)
         for d in removed:
             ev_seq = r.room_log_event(room, "removed", d)
-            r.inbox_deliver(d, "event", {"type": "room.event", "room": room, "event": "removed", "device": d,
-                                         "room_seq": frames.fmt_seq(ev_seq)})
+            # At most one pending removal notice per (device, room), and it
+            # counts against the inbox limit, so repeated add/remove cannot
+            # grow an inbox. A skipped notice is not lost: sync replays the
+            # removal event from the room log for rooms the device is no
+            # longer a member of (h_sync).
+            dedup = "removed:" + room
+            if st.inbox_dedup(d, dedup) is not None:
+                continue
+            ev = {"type": "room.event", "room": room, "event": "removed", "device": d,
+                  "room_seq": frames.fmt_seq(ev_seq)}
+            if r.inbox_deliver(d, "event", ev, dedup=dedup) is None:
+                r.metrics["removal_notices_skipped_total"] += 1
         return seq
 
     def h_room_create(self, f, rid):
@@ -982,6 +999,11 @@ class Session:
             if row["kind"] == "private":
                 m = st.member(room, self.device)
                 if m is None:
+                    # removed: send the room's record of it first, so a device whose
+                    # inbox notice was skipped (inbox full) still learns why
+                    ev = st.removal_event(room, self.device)
+                    if ev is not None:
+                        self.write_line((ev + "\n").encode())
                     self.send(ProtocolError(403, "not_member", None, room=room).frame(rid))
                     continue
                 lo, hi = st.room_log_range(room)

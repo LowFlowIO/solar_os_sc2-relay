@@ -356,3 +356,48 @@ def test_epoch_key_travels_as_dm():
             pt = sc2ref.unpad(sc2ref.aead_open(mk, b64d(e["nonce"]), b64d(e["ct"]), hdr))
             assert b"sealed" in pt
     run(body())
+
+
+def test_removal_notices_are_bounded_per_room_and_by_the_inbox_limit():
+    async def body():
+        async with relay_server(max_queue=3) as srv:
+            port = srv.ports["plain"]
+            admin, (carol,), room = await setup_room(port, 2)
+            carol.conn.close()
+            st = srv.relay.store
+            # repeated remove/add while carol is offline: one pending notice, no growth
+            for i in range(5):
+                assert (await room.change(admin, "remove", carol.id))["type"] == "ack"
+                assert st.inbox_stats(carol.id)[0] == 1
+                assert (await room.change(admin, "add", carol.id))["type"] == "ack"
+                assert st.inbox_stats(carol.id)[0] == 0  # re-added: the old notice is stale and dropped
+            assert (await room.change(admin, "remove", carol.id))["type"] == "ack"
+            # a second room's removal is its own notice
+            room2 = PrivateRoom()
+            await room2.create(admin, {"max": 32})
+            await room2.change(admin, "add", carol.id)
+            await room2.change(admin, "remove", carol.id)
+            assert st.inbox_stats(carol.id)[0] == 2
+            # fill carol's inbox to the limit with a DM; a third room's notice is skipped
+            await carol.connect(port, sync=False)
+            await carol.publish(1)
+            carol.conn.close()
+            admin.start_session(await admin.claim(carol.id))
+            env = admin.seal_dm(carol.id, {"t": "text", "body": "hi"})
+            assert (await admin.conn.request({"type": "dm.send", "rid": "d", "to": carol.id, "env": env}))[
+                "type"] == "ack"
+            room3 = PrivateRoom()
+            await room3.create(admin, {"max": 32})
+            await room3.change(admin, "add", carol.id)
+            await room3.change(admin, "remove", carol.id)
+            assert st.inbox_stats(carol.id)[0] == 3
+            assert srv.relay.metrics["removal_notices_skipped_total"] == 1
+            # carol still learns it: sync replays the room's removal event before 403
+            await carol.connect(port, sync=False)
+            items, done = await carol.sync(rooms={room3.room: "0"})
+            ev = [f for f in items if f.get("type") == "room.event"]
+            assert [(f["room"], f["event"], f["device"]) for f in ev if "room_seq" not in f] == [
+                (room3.room, "removed", carol.id)]
+            err = [f for f in items if f.get("type") == "error"]
+            assert err and err[0]["code"] == 403 and err[0]["room"] == room3.room
+    run(body())

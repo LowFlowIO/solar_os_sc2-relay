@@ -299,6 +299,12 @@ class Storage:
         self.db.execute("INSERT INTO room_log(room, seq, kind, audience, data, ts, dedup) VALUES(?, ?, ?, ?, ?, ?, ?)",
                         (room, seq, kind, audience, data, now, dedup))
 
+    def removal_event(self, room, dev):
+        """The latest retained room.event "removed" for dev (JSON text), or None."""
+        return self.scalar("SELECT data FROM room_log WHERE room=? AND kind='event' AND data LIKE ? "
+                           "ORDER BY seq DESC LIMIT 1",
+                           (room, '%"event":"removed","device":"' + dev + '",%'))
+
     def room_log_dedup(self, room, dedup):
         return self.scalar("SELECT seq FROM room_log WHERE room=? AND dedup=?", (room, dedup))
 
@@ -457,6 +463,9 @@ class Storage:
             self.db.execute("INSERT INTO inbox(device, seq, kind, data, size, ts, dedup) VALUES(?, ?, ?, ?, ?, ?, ?)",
                             (dev, seq, kind, data, size, now, dedup))
         return seq
+
+    def inbox_drop(self, dev, dedup):
+        return self.db.execute("DELETE FROM inbox WHERE device=? AND dedup=?", (dev, dedup)).rowcount
 
     def inbox_after(self, dev, after, limit):
         return self.all("SELECT * FROM inbox WHERE device=? AND seq>? ORDER BY seq LIMIT ?", (dev, after, limit))
