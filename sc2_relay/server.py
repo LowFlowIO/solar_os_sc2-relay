@@ -129,6 +129,7 @@ class RelayServer:
         else:
             log.info("admin interface disabled (set SC2_ADMIN_TOKEN to enable)")
         self._tasks.append(asyncio.ensure_future(self._retention_loop()))
+        self._tasks.append(asyncio.ensure_future(self._sweep_loop()))
         log.info("relay %s up (profile %s, legacy_v1=%s, web_view=%s): %s", self.relay.relay_id, c.profile,
                  c.legacy_v1, c.web_view, ", ".join("%s:%d" % kv for kv in sorted(self.ports.items())))
 
@@ -221,6 +222,18 @@ class RelayServer:
             except Exception:
                 log.exception("retention failed")
 
+    async def _sweep_loop(self):
+        # idle and lifetime limits are enforced here, not by the read timeout,
+        # so a client that only sends pings is still closed after SC2_IDLE_TIMEOUT
+        c = self.config
+        interval = max(1, min(30, c.idle_timeout // 10, c.max_session_seconds or 30))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                self.relay.sweep()
+            except Exception:
+                log.exception("session sweep failed")
+
     # ---------------- NDJSON (chat:// and chats://) ----------------
 
     async def _ndjson(self, reader, writer, transport):
@@ -263,7 +276,7 @@ class RelayServer:
         session = relay.new_session(ip, transport, write_line, close)
         try:
             while not state["closing"]:
-                timeout = self.config.idle_timeout if session.state in ("authed", "v1") else self.config.auth_timeout
+                timeout = self.config.idle_timeout if session.established else self.config.auth_timeout
                 try:
                     data = await asyncio.wait_for(reader.read(8192), timeout)
                 except asyncio.TimeoutError:
@@ -325,7 +338,7 @@ class RelayServer:
         frag_op = None
         try:
             while not state["closing"]:
-                timeout = self.config.idle_timeout if session.state == "authed" else self.config.auth_timeout
+                timeout = self.config.idle_timeout if session.established else self.config.auth_timeout
                 try:
                     hdr = await asyncio.wait_for(reader.readexactly(2), timeout)
                 except asyncio.TimeoutError:

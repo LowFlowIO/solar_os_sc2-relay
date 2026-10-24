@@ -9,13 +9,14 @@ ERRORS = {
     401: ("auth_required", "bad_sig"),
     403: ("forbidden", "not_member", "admit_required", "muted", "banned"),
     404: ("unknown_device", "unknown_room"),
-    409: ("epoch_conflict", "stale_epoch"),
+    408: ("idle",),
+    409: ("epoch_conflict", "stale_epoch", "replaced"),
     410: ("prekey_exhausted",),
     413: ("too_large",),
     426: ("upgrade_required",),
     429: ("rate_limited",),
     501: ("not_supported",),
-    503: ("server_full",),
+    503: ("server_full", "evicted", "reconnect"),
     507: ("inbox_full",),
 }
 
@@ -32,12 +33,16 @@ DEFAULT_TEXT = {
     "unknown_room": "unknown room",
     "epoch_conflict": "commit does not follow the current epoch",
     "stale_epoch": "message uses an old epoch",
+    "idle": "closed after a period without activity; reconnect to continue",
+    "replaced": "session replaced by a newer login of this device",
     "prekey_exhausted": "no one-time prekey left; bundle has the signed prekey only",
     "too_large": "too large",
     "upgrade_required": "this relay speaks SC2 v2 only",
     "rate_limited": "slow down",
     "not_supported": "not supported by this relay",
     "server_full": "server full",
+    "evicted": "relay full; this idle session was closed to admit another",
+    "reconnect": "session lifetime reached; reconnect",
     "inbox_full": "recipient inbox is full",
 }
 

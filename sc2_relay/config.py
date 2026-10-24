@@ -166,7 +166,12 @@ class Config:
             "max_connections": _int(env, "SC2_MAX_CONNECTIONS", 2048, 1, 1000000),
             "max_conn_per_ip": _int(env, "SC2_MAX_CONN_PER_IP", 16, 1, 1000000),
             "auth_timeout": _int(env, "SC2_AUTH_TIMEOUT", 30, 1, 3600),
+            # seconds without a frame other than ping; pings alone do not keep a session
             "idle_timeout": _int(env, "SC2_IDLE_TIMEOUT", 300, 10, 86400),
+            # when full, a new login may displace a session idle at least this long
+            "evict_min_idle": _int(env, "SC2_EVICT_MIN_IDLE", 60, 0, 86400),
+            # 0 = no limit on how long one authenticated session may last
+            "max_session_seconds": _int(env, "SC2_MAX_SESSION_SECONDS", 0, 0, 1 << 31),
             "send_buffer_max": _int(env, "SC2_SEND_BUFFER_MAX", 1 << 20, 65536, 1 << 30),
             "retention_interval": _int(env, "SC2_RETENTION_INTERVAL", 60, 1, 86400),
             # logging

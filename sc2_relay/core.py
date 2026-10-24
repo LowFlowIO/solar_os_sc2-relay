@@ -23,6 +23,7 @@ import traceback
 from sc2proto import (LineBuffer, ProtocolError, b64d, b64e, dumpb, dumps, frames, hexd, hexe, layouts, limits,
                      loads, rooms)
 from sc2proto import relaykey
+from sc2proto.errors import DEFAULT_TEXT, error_frame
 from sc2proto.rooms import RoomState
 
 from . import crypto
@@ -319,11 +320,80 @@ class Relay:
         self.metrics["connections_total"] += 1
         return s
 
+    # Connection slots. SC2_MAX_CONNECTIONS and SC2_MAX_CONN_PER_IP bound the
+    # open sessions. When a cap is reached, a new connection may still take
+    # the slot of the longest-idle established session (idle at least
+    # SC2_EVICT_MIN_IDLE), but only once it has authenticated: eviction at
+    # TCP accept would let anyone without a key churn every idle device off
+    # the relay. Until then the newcomer occupies one of a few handshake
+    # slots above the cap (HANDSHAKE_SLOTS, one per IP over its own cap);
+    # these expire after SC2_AUTH_TIMEOUT like any unauthenticated session.
+
+    HANDSHAKE_SLOTS = 16
+
     def connection_allowed(self, ip):
+        """Admit a raw connection (before hello/auth)?"""
+        pending = [s for s in self.sessions if not s.established]
+        same_ip = [s for s in self.sessions if s.ip == ip]
         if len(self.sessions) >= self.cfg.max_connections:
-            return False
-        n = sum(1 for s in self.sessions if s.ip == ip)
-        return n < self.cfg.max_conn_per_ip
+            if len(pending) >= self.HANDSHAKE_SLOTS or self.evictable() is None:
+                self.metrics["connections_refused_total"] += 1
+                return False
+        if len(same_ip) >= self.cfg.max_conn_per_ip:
+            if any(not s.established for s in same_ip) or self.evictable(ip) is None:
+                self.metrics["connections_refused_total"] += 1
+                return False
+        return True
+
+    def evictable(self, ip=None, exclude=None):
+        """The longest-idle established session (optionally from one IP) idle
+        at least SC2_EVICT_MIN_IDLE, or None."""
+        cut = self.clock() - self.cfg.evict_min_idle
+        best = None
+        for s in self.sessions:
+            if s is exclude or s.closed or not s.established or s.active > cut:
+                continue
+            if ip is not None and s.ip != ip:
+                continue
+            if best is None or s.active < best.active:
+                best = s
+        return best
+
+    def make_room(self, session):
+        """Called when a session authenticates (or a legacy v1 client says
+        hello). Evicts idle sessions so the caps hold; False if the relay is
+        full of active sessions and the newcomer must be refused."""
+        while True:
+            over = len(self.sessions) > self.cfg.max_connections
+            over_ip = sum(1 for s in self.sessions if s.ip == session.ip) > self.cfg.max_conn_per_ip
+            if not over and not over_ip:
+                return True
+            # a victim from the same IP fixes both caps; any idle session fixes the global one
+            victim = self.evictable(session.ip if over_ip else None, exclude=session)
+            if victim is None:
+                self.metrics["connections_refused_total"] += 1
+                return False
+            victim.kick(503, "evicted")
+            self.metrics["sessions_evicted_total"] += 1
+
+    def sweep(self):
+        """Close established sessions idle (no frame other than ping) for
+        SC2_IDLE_TIMEOUT, and those older than SC2_MAX_SESSION_SECONDS when
+        set. Returns the number closed. Runs periodically from the server."""
+        now = self.clock()
+        n = 0
+        for s in list(self.sessions):
+            if s.closed or not s.established:
+                continue
+            if now - s.active >= self.cfg.idle_timeout:
+                s.kick(408, "idle")
+                self.metrics["sessions_idle_closed_total"] += 1
+                n += 1
+            elif self.cfg.max_session_seconds and now - s.established >= self.cfg.max_session_seconds:
+                s.kick(503, "reconnect")
+                self.metrics["sessions_expired_total"] += 1
+                n += 1
+        return n
 
 
 class Session:
@@ -345,6 +415,8 @@ class Session:
         self.v1 = None
         self.closed = False
         self.created = relay.clock()
+        self.established = None    # clock time of auth (or legacy v1 hello)
+        self.active = self.created  # last frame other than ping/pong
 
     # transport side
 
@@ -359,6 +431,18 @@ class Session:
     def close(self):
         if not self.closed:
             self._close()
+
+    def kick(self, code, err, text=None, presence=True):
+        """Tell the client why with a final error frame, close, and release
+        the slot right away (the transport's own cleanup is then a no-op)."""
+        if self.closed:
+            return
+        if self.state == "v1":
+            self.send({"type": "error", "text": text or DEFAULT_TEXT[err], "code": code})
+        else:
+            self.send(error_frame(code, err, text))
+        self.close()
+        self.on_closed(presence)
 
     def feed(self, data):
         self.relay.metrics["bytes_in_total"] += len(data)
@@ -389,7 +473,7 @@ class Session:
             return
         self.handle_line(text)
 
-    def on_closed(self):
+    def on_closed(self, presence=True):
         if self.closed:
             return
         self.closed = True
@@ -403,7 +487,7 @@ class Session:
                 group.discard(self)
                 if not group:
                     del r.by_device[self.device]
-                    if self.presence in ("online", "away"):
+                    if presence and self.presence in ("online", "away"):
                         self._broadcast_presence("offline")
 
     # protocol side
@@ -418,11 +502,14 @@ class Session:
             if not isinstance(obj, dict):
                 self.v1.error("missing type", 400)
                 return
+            self.active = r.clock()
             self.v1.handle(obj)
             return
         rid = None
         try:
             t, obj, rid = frames.parse(line)
+            if t not in ("ping", "pong"):
+                self.active = r.clock()
             if self.state == "new":
                 self._first(t, obj, rid)
                 return
@@ -464,6 +551,10 @@ class Session:
             self.state = "v1"
             self.v1 = V1Client(r.v1, self)
             self.v1.handle(obj)
+            if self.v1.authed and not self.closed:
+                self.established = r.clock()
+                if not r.make_room(self):
+                    self.kick(503, "server_full")
             return
         f = {"type": "error", "code": 401, "err": "auth_required", "text": "hello required"}
         if rid is not None:
@@ -492,6 +583,15 @@ class Session:
             raise ProtocolError(403, "forbidden", "device key was purged by the operator", close=True)
         if r.cfg.admission == "allowlist" and dev not in r.cfg.allowlist:
             raise ProtocolError(403, "admit_required", "device not on the allowlist", close=True)
+        # one live session per device key: a new login replaces the old one
+        # (a reconnect after a network change often leaves a half-open socket)
+        for old in list(r.by_device.get(dev, ())):
+            old.kick(409, "replaced", presence=False)
+            r.metrics["sessions_replaced_total"] += 1
+        self.established = r.clock()
+        if not r.make_room(self):
+            self.established = None
+            raise ProtocolError(503, "server_full", close=True)
         now = r.now()
         row = store.device(dev)
         new = row is None

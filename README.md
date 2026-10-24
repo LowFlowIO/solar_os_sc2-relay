@@ -235,15 +235,28 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_CLAIM_PER_MIN` | `20` | `keys.claim` per device. |
 | `SC2_REGISTER_PER_HOUR` | `30` | New device registrations per IP. |
 | `SC2_REPORT_PER_MIN` | `5` | Reports per device. |
-| `SC2_MAX_CONNECTIONS` / `SC2_MAX_CONN_PER_IP` | `2048` / `16` | Connection caps. |
+| `SC2_MAX_CONNECTIONS` / `SC2_MAX_CONN_PER_IP` | `2048` / `16` | Connection caps. When one is reached, a new login can take the slot of an idle session (see [Connection slots](#connection-slots)). |
 | `SC2_AUTH_TIMEOUT` | `30` | Seconds to finish hello and auth. |
-| `SC2_IDLE_TIMEOUT` | `300` | Idle disconnect (clients ping). |
+| `SC2_IDLE_TIMEOUT` | `300` | Seconds an authenticated (or legacy v1) session may go without sending a frame other than `ping`. Pings keep NAT and TCP state warm but do not count as activity; the session is closed with `408 idle`. |
+| `SC2_EVICT_MIN_IDLE` | `60` | When the relay or an IP is at its cap, the longest-idle session is closed (`503 evicted`) to admit a new login, if it has been idle at least this many seconds. |
+| `SC2_MAX_SESSION_SECONDS` | `0` | Maximum lifetime of one session; it is then closed with `503 reconnect`. `0` = no limit. |
 | `SC2_SEND_BUFFER_MAX` | `1048576` | Per-connection outbound buffer. A slow reader is disconnected beyond this. |
 | `SC2_RETENTION_INTERVAL` | `60` | Seconds between retention sweeps. |
 | `SC2_LOG_LEVEL` | `INFO` | Python log level. |
 | `SC2_LOG_DEVICE_IDS` | `false` | Log device IDs; the default writes `<device>` instead. |
 
 Rate and limit values marked tunable can be changed at runtime with `admin tune`, which persists them in the database. Tunable keys are `admission`, `admit_code`, `post_per_min`, `post_burst`, `ip_post_per_min`, `ip_post_burst`, `room_post_per_min`, the `slow_*` settings, `max_queue`, `max_queue_bytes`, `ttl_days`, `send_per_min`, `send_burst` and `claim_per_min`.
+
+### Connection slots
+
+A connection holds a slot until it closes, so the relay bounds how long an idle client can keep one:
+
+* **One session per device key.** When a device authenticates while it already has a session, the older one gets `409 replaced` and is closed. This also clears half-open sockets left by a network change. Two devices sharing one key will keep replacing each other; give every device its own key. Legacy v1 clients have no device key and are not affected.
+* **Pings are not activity.** `SC2_IDLE_TIMEOUT` counts from the last frame other than `ping` (WebSocket ping and pong control frames do not count either). A client that only pings is closed with `408 idle` and reconnects: DMs wait in its inbox and rooms catch up on the next `sync`. Unauthenticated sessions still have `SC2_AUTH_TIMEOUT`.
+* **Eviction when full.** At `SC2_MAX_CONNECTIONS`, or at `SC2_MAX_CONN_PER_IP` for one address, a new connection is admitted to the handshake only if some session (from that address, for the per-IP cap) has been idle at least `SC2_EVICT_MIN_IDLE`. Nobody is evicted on accept: the longest-idle session is closed with `503 evicted` only when the newcomer has passed auth (or legacy v1 hello), and if everyone has become active in the meantime the newcomer gets `503 server_full`. Evicting on accept would let anyone, without a key, push every idle device off the relay with bare TCP connections. Handshakes above the cap are limited to 16 at a time (one per address over its own cap) and expire after `SC2_AUTH_TIMEOUT`.
+* **Session lifetime.** With `SC2_MAX_SESSION_SECONDS`, sessions older than that are closed with `503 reconnect`.
+
+Every close is preceded by an error frame naming the reason (`{"type":"error","code":...}` in v1 style for legacy clients). `/metrics` counts them in `sessions_replaced_total`, `sessions_idle_closed_total`, `sessions_evicted_total`, `sessions_expired_total` and `connections_refused_total`.
 
 ## Wire formats
 
@@ -272,7 +285,7 @@ The three records are fixed-size binary so a device can build and verify them wi
 * **Plain `chat://`.** Content stays end-to-end encrypted and auth is a signature challenge, but metadata and the relay key fingerprint are exposed to the network. Use it on trusted LANs only.
 * **Legacy v1 is plaintext and unauthenticated** apart from an optional shared token. It is kept for existing gateways and never bridged. Disable it (`SC2_LEGACY_V1=false`) once devices are on v2.
 * **Public rooms are public.** Posts are signed plaintext and appear in the web view when enabled. Clients show the PUBLIC label and the first-join notice. `noindex` asks search engines not to index the view but does not enforce it.
-* **Limits.** Every frame is size-checked before parsing (16 KiB line cap for v2) and validated strictly: canonical base64, exact field sets, bounded lists. Unauthenticated connections time out. Per-IP connection and registration caps limit floods.
+* **Limits.** Every frame is size-checked before parsing (16 KiB line cap for v2) and validated strictly: canonical base64, exact field sets, bounded lists. Unauthenticated connections time out, and authenticated ones are closed after `SC2_IDLE_TIMEOUT` without real traffic. Per-IP connection and registration caps limit floods; eviction of idle sessions happens only after a successful auth.
 * **Logs** never contain message content. Device IDs are replaced by `<device>` unless `SC2_LOG_DEVICE_IDS=true`.
 
 ## Tests
@@ -295,6 +308,7 @@ SC2_CLIENT_DIR=/path/to/solar_os /path/venv/bin/python -m pytest -q   # cross te
 | Admin and bans | Signed removals, key and IP bans. |
 | Legacy v1 | chatd parity, and `426` under the official profile. |
 | Web view | HTML and JSON, `noindex`. |
+| Connection slots | One session per device key, pings not counted as activity, eviction of idle sessions at auth when full, session lifetime. |
 | Storage and config | Migrations, configuration. |
 | TLS and WebSocket | TLS and WS transports. |
 | TLS hot reload | `--reuse-key` renewal keeps connections and the pin, key rotation publishes the new pin, broken pairs are skipped, ACME first start, the certbot deploy hook. |
