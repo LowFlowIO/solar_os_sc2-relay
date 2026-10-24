@@ -13,7 +13,7 @@ The relay is **isolated from the firmware core**: this repository (LowFlowIO/sol
 
 * **DMs** are opaque Double Ratchet envelopes. The relay checks only the routing header (`from`, `to`, sizes) and stores each envelope in a per-device queue. Queues are bounded by 7 days, 500 messages and 5 MB per device; when a queue is full, the send gets `507 inbox_full`. Relay-generated inbox items (room removal notices) count against the same limits. Envelopes are deleted on `ack`.
 * **Private rooms** carry ciphertext only. Membership changes are **admin-signed commits**, one change per commit, chained by commit ID; the relay verifies and sequences them before applying (see the wire formats below). A room has at most 32 members. A removed device gets a `room.event removed` notice in its own inbox, and routing to it stops at once. The notice counts against the inbox limits like a DM, and at most one per room is pending (it is dropped if the device is added back before it syncs). If the inbox is full the notice is skipped (`removal_notices_skipped_total`); the device still learns of the removal when it syncs the room: the relay sends the room's `room.event removed` record (while the room log retains it) followed by `403 not_member`. New members get **no history**: they sync from their join sequence. Sharing older messages is the opt-in client-side `room.share`.
-* **Public rooms** are signed plaintext. The relay **verifies every post signature on ingest**, keeps at most 7 days or 10,000 posts per room, and accepts bodies of at most 1,024 bytes. The first time a device joins a public room it gets a notice with the `PUBLIC · not encrypted` label. Rooms come from configuration (`SC2_PUBLIC_ROOMS`); clients cannot create them unless `SC2_PUBLIC_ROOM_CREATE=any`.
+* **Public rooms** are signed plaintext. The relay **verifies every post signature on ingest**, keeps at most 7 days or 10,000 posts per room, and accepts bodies of at most 1,024 bytes. The first time a device joins a public room it gets a notice with the `PUBLIC · not encrypted` label. Rooms come from configuration (`SC2_PUBLIC_ROOMS`); clients cannot create them unless `SC2_PUBLIC_ROOM_CREATE=any`. Message IDs are chosen by clients and unique per author only, so a post is named by room, author (`from`) and ID: a `del` post deletes the sender's own post with that `ref`, and `room.report` takes an optional `author` (device ID, like `from`). A report without `author` is accepted only if exactly one post in the room has that ID; otherwise it gets `409 ambiguous_ref`. Reports store the resolved author (`admin reports`).
 * **Anti-spam** is limited to rate limits (per key, per IP, per room) and **slow mode**. Slow mode applies to young keys automatically (`SC2_SLOW_KEY_MINUTES`, optional `SC2_SLOW_UNTIL_POSTS`), and the operator can turn it on for a whole room. Nothing filters content.
 * **Moderation** covers public rooms only:
   * Removals are **relay-signed** `room.mod` events. Clients verify them against the relay key published in `/.well-known/solaros-relay`.
@@ -151,7 +151,7 @@ export SC2_ADMIN_TOKEN=...
 python -m sc2_relay.admin status
 python -m sc2_relay.admin rooms
 python -m sc2_relay.admin posts general --q spam --limit 20
-python -m sc2_relay.admin remove general <ref-hex16> [--device <id>]     # relay-signed removal
+python -m sc2_relay.admin remove general <ref-hex16> [--device <id>]     # relay-signed removal; --device required if several authors used the ID (409)
 python -m sc2_relay.admin ban --device <id> --duration 86400 --reason spam --remove-posts
 python -m sc2_relay.admin ban --ip 203.0.113.7 --duration 3600            # silent
 python -m sc2_relay.admin unban --device <id>
@@ -304,7 +304,7 @@ SC2_CLIENT_DIR=/path/to/solar_os /path/venv/bin/python -m pytest -q   # cross te
 |---|---|
 | End-to-end DMs | The relay driven by the Python `sc2ref` client (`tests/vendor/sc2ref.py`). |
 | Private rooms | Commit chain (head/epoch conflicts, roster hash, genesis rules, last admin), removal, size cap, no history, opt-in share, invites. |
-| Public rooms | Signature verify, limits, labels, slow mode. |
+| Public rooms | Signature verify, limits, labels, slow mode, posts resolved by author and message ID. |
 | Admin and bans | Signed removals, key and IP bans. |
 | Legacy v1 | chatd parity, and `426` under the official profile. |
 | Web view | HTML and JSON, `noindex`. |

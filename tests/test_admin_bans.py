@@ -28,7 +28,7 @@ def test_admin_requires_token_and_loopback():
             st, b = await admin(srv, "GET", "/admin/status", token="wrong")
             assert st == 401
             st, b = await admin(srv, "GET", "/admin/status")
-            assert st == 200 and b["relay_id"] == "relay.test" and b["schema"] == 4
+            assert st == 200 and b["relay_id"] == "relay.test" and b["schema"] == 5
             sock = srv.servers[-1].sockets[0].getsockname()
             assert sock[0] == "127.0.0.1"
         # the admin API is not served on the public HTTP port

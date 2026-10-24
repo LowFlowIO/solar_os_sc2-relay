@@ -357,7 +357,10 @@ class AdminHttp:
             if not is_hex(ref, 16):
                 raise HttpError(400, "ref must be a 16 hex message ID")
             dev = self._device(b["device"]) if b.get("device") else None
-            n = r.mod_remove(room, ref, dev)
+            try:
+                n = r.mod_remove(room, ref, dev)
+            except ProtocolError:
+                raise HttpError(409, "several authors used this message ID; give device")
             if n == 0:
                 raise HttpError(404, "no such post")
             return json_response({"removed": n})

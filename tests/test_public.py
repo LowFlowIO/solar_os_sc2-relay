@@ -83,10 +83,10 @@ def test_post_ingest_pipeline():
             e = await ana.conn.request({"type": "room.post", "rid": "u", "room": ROOM,
                                         "post": dict(ana.post(ROOM, "x"), t="edit")})
             assert e["code"] == 400
-            # del is honoured only for the author
+            # a del names the sender's own post: ben has no post with this ID
             e = await ben.conn.request({"type": "room.post", "rid": "d0", "room": ROOM,
                                         "post": ben.post(ROOM, "", t="del", ref=post["id"])})
-            assert e["code"] == 403
+            assert e["code"] == 400 and e["text"] == "unknown ref"
             ack = await ana.conn.request({"type": "room.post", "rid": "d1", "room": ROOM,
                                           "post": ana.post(ROOM, "", t="del", ref=post["id"])})
             assert ack["type"] == "ack"
@@ -243,4 +243,60 @@ def test_reports_and_creation_policy():
             assert st["title"] == "#mine" and st["first_join"]
             # the creator gets no moderation powers: admin API is the only remover
             assert srv.relay.store.room("pub:mine")["kind"] == "public"
+    run(body())
+
+
+def test_message_id_collisions_across_authors():
+    async def body():
+        async with relay_server() as srv:
+            port = srv.ports["plain"]
+            ana, ben, eve = Device(), Device(), Device()
+            for d in (ana, ben, eve):
+                await d.connect(port)
+                await d.join(ROOM)
+            mid = "ab" * 8
+            # eve posts first with the ID ana is going to use
+            p_eve = eve.post(ROOM, "squatting", msg_id=bytes.fromhex(mid))
+            assert (await eve.conn.request({"type": "room.post", "rid": "e", "room": ROOM, "post": p_eve}))[
+                "type"] == "ack"
+            p_ana = ana.post(ROOM, "mine", msg_id=bytes.fromhex(mid))
+            assert (await ana.conn.request({"type": "room.post", "rid": "a", "room": ROOM, "post": p_ana}))[
+                "type"] == "ack"
+            # ana can still delete her own post; eve's is untouched
+            ack = await ana.conn.request({"type": "room.post", "rid": "d", "room": ROOM,
+                                          "post": ana.post(ROOM, "", t="del", ref=mid)})
+            assert ack["type"] == "ack"
+            st = srv.relay.store
+            assert st.post_by_id(ROOM, ana.id, mid)["deleted"] == 1
+            assert st.post_by_id(ROOM, eve.id, mid)["deleted"] == 0
+            # a report without author is ambiguous now; with author it targets that post
+            e = await ben.conn.request({"type": "room.report", "rid": "r0", "room": ROOM, "ref": mid})
+            assert e["code"] == 409 and e["err"] == "ambiguous_ref" and e["ref"] == mid
+            ack = await ben.conn.request({"type": "room.report", "rid": "r1", "room": ROOM, "ref": mid,
+                                          "author": eve.id, "reason": "spam"})
+            assert ack["type"] == "ack"
+            e = await ben.conn.request({"type": "room.report", "rid": "r2", "room": ROOM, "ref": mid,
+                                        "author": ben.id})
+            assert e["code"] == 400
+            e = await ben.conn.request({"type": "room.report", "rid": "r3", "room": ROOM, "ref": mid,
+                                        "author": "zz"})
+            assert e["code"] == 400
+            sts, b = await admin(srv, "GET", "/admin/reports")
+            assert [(x["ref"], x["author"]) for x in b["reports"]] == [(mid, eve.id)]
+            # the admin removal needs the device when the ID is ambiguous
+            sts, b = await admin(srv, "POST", "/admin/remove", {"room": "general", "ref": mid})
+            assert sts == 409
+            sts, b = await admin(srv, "POST", "/admin/remove", {"room": "general", "ref": mid, "device": eve.id})
+            assert sts == 200 and b["removed"] == 1
+            assert st.post_by_id(ROOM, eve.id, mid)["removed"] == 1
+            assert st.post_by_id(ROOM, ana.id, mid)["removed"] == 0
+            mod = await ana.conn.expect("room.mod")
+            assert mod["action"] == "remove" and mod["device"] == eve.id and mod["ref"] == mid
+            # an unambiguous ID still works without author (older clients)
+            p = ana.post(ROOM, "unique")
+            await ana.conn.request({"type": "room.post", "rid": "u", "room": ROOM, "post": p})
+            ack = await ben.conn.request({"type": "room.report", "rid": "r4", "room": ROOM, "ref": p["id"]})
+            assert ack["type"] == "ack"
+            sts, b = await admin(srv, "GET", "/admin/reports")
+            assert b["reports"][-1]["author"] == ana.id
     run(body())

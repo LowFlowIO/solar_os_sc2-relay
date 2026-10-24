@@ -20,17 +20,19 @@ def test_migrations_from_v1_schema_keep_data(tmp_path):
         db.execute(stmt)
     db.execute("PRAGMA user_version=1")
     db.execute("INSERT INTO devices(id, ik, first_seen, last_seen) VALUES('ab', x'00', 1, 1)")
+    db.execute("INSERT INTO reports(room, ref, reporter, reason, ts) VALUES('pub:general', 'aa', 'ab', 'x', 1)")
     db.commit()
     db.close()
     st = Storage(path)
-    assert st.version() == SCHEMA_VERSION == 4
+    assert st.version() == SCHEMA_VERSION == 5
     assert st.device("ab") is not None
+    assert [(r["ref"], r["author"]) for r in st.reports()] == [("aa", None)]  # filed before reports named authors
     st.v1_add_channel("general", 0)
     st.set_setting("x", {"a": 1})
     assert st.setting("x") == {"a": 1}
     st.close()
     st = Storage(path)  # idempotent
-    assert st.version() == 4
+    assert st.version() == 5
     st.close()
     db = sqlite3.connect(path)
     db.execute("PRAGMA user_version=99")

@@ -403,8 +403,13 @@ def _v_room_post(f):
 
 
 def _v_room_report(f):
-    return {"room": public_room(_req(f, "room")), "ref": msg_id_hex(_req(f, "ref"), "ref"),
-            "reason": _str(f.get("reason", ""), "reason", REASON_MAX)}
+    out = {"room": public_room(_req(f, "room")), "ref": msg_id_hex(_req(f, "ref"), "ref"),
+           "reason": _str(f.get("reason", ""), "reason", REASON_MAX)}
+    # message IDs are unique per author only: author (the post's "from")
+    # names the post; without it the ref must be unambiguous in the room
+    if f.get("author") is not None:
+        out["author"] = device_hex(f["author"], "author")
+    return out
 
 
 def _v_dm_send(f):

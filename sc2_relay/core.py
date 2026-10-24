@@ -250,17 +250,29 @@ class Relay:
 
     # ---------------- moderation (admin interface) ----------------
 
+    def resolve_post(self, room, ref, author=None):
+        """The public post (room, author, ref). Message IDs are chosen by
+        clients and unique per author only, so without the author the ID
+        must match exactly one post in the room. Returns the row or None;
+        raises 409 ambiguous_ref when several authors used the ID."""
+        if author is not None:
+            return self.store.post_by_id(room, author, ref)
+        rows = self.store.posts_by_ref(room, ref)
+        if len(rows) > 1:
+            raise ProtocolError(409, "ambiguous_ref", None, ref=ref)
+        return rows[0] if rows else None
+
     def mod_remove(self, room, ref, dev=None):
-        """Remove a public post by message ID (and optional sender); emits one
-        relay-signed room.mod remove per (author, ID), since message IDs are
-        only unique per author. Returns the number of posts removed."""
-        rows = self.store.all("SELECT seq, from_dev FROM public_log WHERE room=? AND id=? AND removed=0" +
-                              (" AND from_dev=?" if dev else ""), (room, ref, dev) if dev else (room, ref))
-        for r in rows:
-            self.store.mark_removed(room, r["seq"])
-        for author in sorted({r["from_dev"] for r in rows}):
-            self._emit_mod(room, "remove", author, ref=ref)
-        return len(rows)
+        """Remove a public post by message ID and author (dev); without dev,
+        only if the ID is unambiguous in the room (409 ambiguous_ref).
+        Emits a relay-signed room.mod remove. Returns 1, or 0 when there is
+        no such post or it was already removed."""
+        row = self.resolve_post(room, ref, dev)
+        if row is None or row["removed"]:
+            return 0
+        self.store.mark_removed(room, row["seq"])
+        self._emit_mod(room, "remove", row["from_dev"], ref=ref)
+        return 1
 
     def mod_ban_key(self, dev, until, reason, remove_posts=False):
         now = self.now()
@@ -936,11 +948,9 @@ class Session:
             self.send(frames.frame("ack", rid, seq=frames.fmt_seq(old["seq"])))
             return
         if post["t"] == "del":
-            orig = r.store.post_any(room, post["ref"])
-            if orig is None:
+            # a delete names the author's own post: (room, from, ref)
+            if r.store.post_by_id(room, post["from"], post["ref"]) is None:
                 raise ProtocolError(400, "bad_request", "unknown ref")
-            if orig["from_dev"] != post["from"]:
-                raise ProtocolError(403, "forbidden", "only the author can delete a post")
         # 5. rate limits and slow mode
         clock = r.clock()
         for wait in (r.post_key.take(self.device, clock, per_min, burst),
@@ -969,9 +979,10 @@ class Session:
         wait = r.report_rate.take(self.device, r.clock())
         if wait:
             raise ProtocolError(429, "rate_limited", None, retry_ms=wait)
-        if r.store.post_any(f["room"], f["ref"]) is None:
+        post = r.resolve_post(f["room"], f["ref"], f.get("author"))
+        if post is None:
             raise ProtocolError(400, "bad_request", "unknown ref")
-        r.store.add_report(f["room"], f["ref"], self.device, f["reason"], r.now())
+        r.store.add_report(f["room"], f["ref"], self.device, f["reason"], r.now(), author=post["from_dev"])
         r.metrics["reports_total"] += 1
         self.send(frames.frame("ack", rid))
 

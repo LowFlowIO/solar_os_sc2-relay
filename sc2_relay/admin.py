@@ -74,7 +74,7 @@ def build_parser():
     p = sub.add_parser("remove")
     p.add_argument("room")
     p.add_argument("ref")
-    p.add_argument("--device")
+    p.add_argument("--device", help="the post's author; required when several authors used this message ID")
     p = sub.add_parser("ban")
     _ban_args(p)
     p.add_argument("--remove-posts", action="store_true")

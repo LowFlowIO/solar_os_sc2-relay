@@ -82,6 +82,11 @@ MIGRATIONS = [
     """
     ALTER TABLE rooms ADD COLUMN head TEXT NOT NULL DEFAULT ''
     """,
+    # 5: reports name the reported post's author; message IDs are only
+    # unique per author (NULL for reports filed before this version)
+    """
+    ALTER TABLE reports ADD COLUMN author TEXT
+    """,
 ]
 
 SCHEMA_VERSION = len(MIGRATIONS)
@@ -342,8 +347,9 @@ class Storage:
     def post_by_id(self, room, dev, msg_id):
         return self.one("SELECT * FROM public_log WHERE room=? AND from_dev=? AND id=?", (room, dev, msg_id))
 
-    def post_any(self, room, msg_id):
-        return self.one("SELECT * FROM public_log WHERE room=? AND id=? ORDER BY seq LIMIT 1", (room, msg_id))
+    def posts_by_ref(self, room, msg_id, limit=2):
+        """Posts in room with this message ID, from any author (oldest first)."""
+        return self.all("SELECT * FROM public_log WHERE room=? AND id=? ORDER BY seq LIMIT ?", (room, msg_id, limit))
 
     def public_add(self, room, seq, post, now):
         self.db.execute("INSERT INTO public_log(room, seq, from_dev, id, post, ts) VALUES(?, ?, ?, ?, ?, ?)",
@@ -434,9 +440,9 @@ class Storage:
         return [dict(r) for r in self.all("SELECT * FROM " + table + " WHERE until IS NULL OR until>? "
                                           "ORDER BY created", (now,))]
 
-    def add_report(self, room, ref, reporter, reason, now):
-        cur = self.db.execute("INSERT INTO reports(room, ref, reporter, reason, ts) VALUES(?, ?, ?, ?, ?)",
-                              (room, ref, reporter, reason, now))
+    def add_report(self, room, ref, reporter, reason, now, author=None):
+        cur = self.db.execute("INSERT INTO reports(room, ref, author, reporter, reason, ts) VALUES(?, ?, ?, ?, ?, ?)",
+                              (room, ref, author, reporter, reason, now))
         return cur.lastrowid
 
     def reports(self, include_resolved=False):
