@@ -282,6 +282,7 @@ class Storage:
         self.db.execute("UPDATE members SET routing=? WHERE room=? AND device=?", (1 if on else 0, room, dev))
 
     def commits(self, room):
+        """Retained membership commits, bounded by the private-room log's retention."""
         return self.all("SELECT * FROM commits WHERE room=? ORDER BY epoch", (room,))
 
     def add_invite(self, room, key, now, cap=16):
@@ -524,6 +525,12 @@ class Storage:
                 out["room_log"] += self.db.execute(
                     "DELETE FROM room_log WHERE room=? AND seq NOT IN (SELECT seq FROM room_log WHERE room=? "
                     "ORDER BY seq DESC LIMIT ?)", (r["room"], r["room"], private_max)).rowcount
+            # Commit copies live only as long as their room-log entries. The
+            # current epoch/head and roster remain in rooms and members.
+            out["commits"] = self.db.execute(
+                "DELETE FROM commits WHERE NOT EXISTS (SELECT 1 FROM room_log "
+                "WHERE room_log.room=commits.room AND room_log.seq=commits.seq AND room_log.kind='commit')"
+            ).rowcount
             for r in self.all("SELECT room, COUNT(*) AS n FROM public_log GROUP BY room HAVING n>?", (public_max,)):
                 lo = self.scalar("SELECT MIN(seq) FROM (SELECT seq FROM public_log WHERE room=? ORDER BY seq DESC "
                                  "LIMIT ?)", (r["room"], public_max))
