@@ -185,7 +185,7 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_BIND` | `0.0.0.0` | Listen address for TLS, plain and HTTP. |
 | `SC2_TLS_CERT`, `SC2_TLS_KEY` | empty | PEM certificate and key. Both set enables `chats://`. |
 | `SC2_TLS_PORT` | `7778` | `chats://` port. |
-| `SC2_PUBLIC_HOST` | (empty) | Host name in the signed descriptor (default: `SC2_ACME_DOMAIN`, else omitted). |
+| `SC2_PUBLIC_HOST` | (empty) | Host name in the signed descriptor (default: `SC2_ACME_DOMAIN`, else omitted), at most 63 characters, the most a device accepts. An `SC2_ACME_DOMAIN` longer than that needs a shorter `SC2_PUBLIC_HOST`; startup refuses the configuration otherwise. |
 | `SC2_PUBLIC_PORT` | `0` | Port in the descriptor when it differs from the listener (NAT, proxy); `0` uses the `chats://` port. |
 | `SC2_DESCRIPTOR_PIN` | `false` | Put the SPKI pin of the `chats://` certificate into the descriptor. |
 | `SC2_FALLBACK_RELAYS` | (empty) | Up to 3 comma-separated `URL KEY` pairs (`chats://host:port[#pin=sha256/...] <relay key b64>`) for the descriptor's fallback list. |

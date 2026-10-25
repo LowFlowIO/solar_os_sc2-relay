@@ -238,6 +238,11 @@ class Config:
             if not re.fullmatch(r"(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}",
                                 self.acme_domain):
                 raise ConfigError("SC2_ACME_DOMAIN must be a public DNS name")
+            if not self.public_host and len(self.acme_domain) > 63:
+                # the descriptor's host line falls back to SC2_ACME_DOMAIN, and
+                # devices accept at most 63 characters there (SC2_DESC_HOST_MAX)
+                raise ConfigError("SC2_ACME_DOMAIN is longer than the 63 characters a device accepts as the "
+                                  "descriptor host; set SC2_PUBLIC_HOST to a name of at most 63 characters")
             if not self.tls_cert and not self.tls_key:
                 self.tls_cert = os.path.join(self.acme_cert_dir, "fullchain.pem")
                 self.tls_key = os.path.join(self.acme_cert_dir, "privkey.pem")

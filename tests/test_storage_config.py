@@ -95,3 +95,13 @@ def test_env_files_and_cli(tmp_path, capsys):
     assert '"relay_id": "r.example"' in capsys.readouterr().out
     p.write_text("SC2_ADMISSION=bogus\n")
     assert main(["--env-file", str(p), "--check-config"]) == 2
+
+
+def test_long_acme_domain_needs_a_short_public_host():
+    long_domain = "a" * 50 + ".relay." + "b" * 20 + ".example.org"
+    assert len(long_domain) > 63
+    with pytest.raises(ConfigError, match="SC2_PUBLIC_HOST"):
+        Config.from_env({"SC2_ACME_DOMAIN": long_domain})
+    c = Config.from_env({"SC2_ACME_DOMAIN": long_domain, "SC2_PUBLIC_HOST": "relay.example.org"})
+    assert c.public_host == "relay.example.org"
+    assert Config.from_env({"SC2_ACME_DOMAIN": "relay.example.org"}).acme_domain == "relay.example.org"
