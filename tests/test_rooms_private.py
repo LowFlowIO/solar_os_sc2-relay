@@ -8,6 +8,7 @@ SPDX-License-Identifier: MIT
 
 import os
 
+import pytest
 import sc2ref
 from helpers import Device, PrivateRoom, b64e, layouts, relay_server, run
 from sc2proto import b64d
@@ -228,6 +229,58 @@ def test_invite_join_request_add_and_no_history():
             assert not any(f.get("event") == "join_request" for f in items)
             items, done = await admin.sync(rooms={room.room: "0"})
             assert any(f.get("event") == "join_request" for f in items)
+    run(body())
+
+
+@pytest.mark.parametrize("admin_reader", [False, True])
+@pytest.mark.parametrize("message_count", [0, 3])
+def test_sync_paginates_past_admin_only_events(admin_reader, message_count):
+    async def body():
+        async with relay_server() as srv:
+            port = srv.ports["plain"]
+            admin, (bob,), room = await setup_room(port, 2)
+            cursor = str(srv.relay.store.room(room.room)["seq"])
+            applicant = Device()
+            await applicant.connect(port)
+            key = os.urandom(32)
+            ack = await admin.conn.request({"type": "room.invite", "rid": admin.rid(),
+                                             "room": room.room, "key": b64e(key)})
+            assert ack["type"] == "ack"
+            proof = b64e(layouts.invite_proof(key, bytes.fromhex(applicant.id)))
+            expected = []
+            # More hidden events than fit in a page, before/between/after messages.
+            for i in range(message_count + 1):
+                for _ in range(5):
+                    assert (await applicant.join(room.room, proof))["type"] == "ack"
+                    event = await admin.conn.expect("room.event", event="join_request")
+                    if admin_reader:
+                        expected.append(event["seq"])
+                if i < message_count:
+                    env = room.seal(admin, {"t": "text", "body": "message %d" % i})
+                    ack = await admin.conn.request({"type": "room.send", "rid": admin.rid(),
+                                                     "room": room.room, "env": env})
+                    assert ack["type"] == "ack"
+                    expected.append(ack["seq"])
+            last = str(srv.relay.store.room(room.room)["seq"])
+            reader = admin if admin_reader else bob
+            reader.conn.close()
+            await reader.connect(port, sync=False)
+            received = []
+            for _ in range(50):
+                items, done = await reader.sync(rooms={room.room: cursor}, max_=2)
+                assert len(items) <= 2
+                if not admin_reader:
+                    assert all(f.get("event") != "join_request" for f in items)
+                received.extend(f["seq"] for f in items)
+                next_cursor = done["rooms"][room.room]
+                if not done["more"]:
+                    assert next_cursor == last
+                    break
+                assert int(next_cursor) > int(cursor)
+                cursor = next_cursor
+            else:
+                pytest.fail("private-room sync did not finish")
+            assert received == expected
     run(body())
 
 

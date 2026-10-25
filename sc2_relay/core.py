@@ -1033,16 +1033,17 @@ class Session:
                 done_rooms[room] = frames.fmt_seq(last)
                 continue
             if row["kind"] == "private":
-                items = st.room_log_after(room, after, budget + 1)
+                items = st.room_log_after(room, after, budget + 1, include_admins=is_admin)
                 for it in items:
                     if budget == 0:
                         more = True
                         break
                     last = it["seq"]
-                    if it["audience"] == "admins" and not is_admin:
-                        continue
                     self.write_line((it["data"] + "\n").encode())
                     budget -= 1
+                else:
+                    if hi is not None and last < hi:
+                        last = hi  # trailing admin-only events are not visible to this member
             else:
                 for seq, kind, data in st.public_after(room, after, budget + 1):
                     if budget == 0:

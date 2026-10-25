@@ -317,8 +317,12 @@ class Storage:
         r = self.one("SELECT MIN(seq) AS lo, MAX(seq) AS hi FROM room_log WHERE room=?", (room,))
         return r["lo"], r["hi"]
 
-    def room_log_after(self, room, after, limit):
-        return self.all("SELECT * FROM room_log WHERE room=? AND seq>? ORDER BY seq LIMIT ?", (room, after, limit))
+    def room_log_after(self, room, after, limit, *, include_admins=True):
+        """Fetch a page of visible records, filtering the audience before LIMIT."""
+        query = "SELECT * FROM room_log WHERE room=? AND seq>?"
+        if not include_admins:
+            query += " AND audience!='admins'"
+        return self.all(query + " ORDER BY seq LIMIT ?", (room, after, limit))
 
     # ---------------- public rooms ----------------
 
