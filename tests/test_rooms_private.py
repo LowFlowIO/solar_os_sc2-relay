@@ -178,6 +178,88 @@ def test_commit_rules():
     run(body())
 
 
+def test_private_genesis_uses_device_send_limit():
+    async def body():
+        async with relay_server(send_per_min=60, send_burst=1) as srv:
+            admin = Device()
+            await admin.connect(srv.ports["plain"])
+            first, second = PrivateRoom(), PrivateRoom()
+            assert (await first.create(admin))["type"] == "ack"
+            denied = await second.create(admin)
+            assert denied["type"] == "error", denied
+            assert (denied["code"], denied["err"], denied["retry_ms"]) == (429, "rate_limited", 1000)
+            # Rejected genesis must not leave an empty room or a stored commit.
+            st = srv.relay.store
+            assert st.room(second.room) is None
+            assert st.commits(second.room) == []
+            assert st.room_log_range(second.room) == (None, None)
+            assert st.members(second.room) == []
+            srv.relay.clock.advance(1)
+            ack = await second.create(admin)
+            assert ack["type"] == "ack" and ack["epoch"] == 1
+            assert st.room(second.room)["head"] == second.state.head
+    run(body())
+
+
+def test_rate_limited_commit_preserves_state_and_can_be_retried():
+    async def body():
+        async with relay_server(send_per_min=60, send_burst=2) as srv:
+            admin, (bob,), room = await setup_room(srv.ports["plain"], 2)
+            st = srv.relay.store
+            commit = room.commit(admin, "remove", bob.id)
+
+            def snapshot():
+                return {table: [tuple(row) for row in st.all("SELECT * FROM " + table)]
+                        for table in ("rooms", "members", "commits", "room_log", "inbox")}
+
+            before = snapshot()
+            denied = await admin.conn.request(frame(room, commit, admin.rid()))
+            assert denied["type"] == "error", denied
+            assert (denied["code"], denied["err"], denied["retry_ms"]) == (429, "rate_limited", 1000)
+            assert snapshot() == before
+            srv.relay.clock.advance(1)
+            # Invalid signatures must not consume the freshly refilled token.
+            bad = await admin.conn.request(frame(room, dict(commit, sig=b64e(bytes(64))), admin.rid()))
+            assert bad["code"] == 401 and bad["err"] == "bad_sig"
+            assert snapshot() == before
+            ack = await admin.conn.request(frame(room, commit, admin.rid()))
+            assert ack["type"] == "ack" and ack["epoch"] == 3
+            room.accept(commit)
+            assert ack["head"] == room.state.head
+            assert st.member(room.room, bob.id) is None
+            assert st.inbox_stats(bob.id)[0] == 1
+    run(body())
+
+
+@pytest.mark.parametrize("message_kind", ["dm", "room"])
+def test_private_commits_share_rate_with_messages(message_kind):
+    async def body():
+        async with relay_server(send_per_min=60, send_burst=3) as srv:
+            admin, (bob,), room = await setup_room(srv.ports["plain"], 2)
+            if message_kind == "dm":
+                await bob.publish(1)
+                admin.start_session(await admin.claim(bob.id))
+
+            async def send_message():
+                inner = {"t": "text", "body": "shared send quota"}
+                if message_kind == "dm":
+                    return await admin.conn.request({"type": "dm.send", "rid": admin.rid(), "to": bob.id,
+                                                     "env": admin.seal_dm(bob.id, inner)})
+                return await admin.conn.request({"type": "room.send", "rid": admin.rid(), "room": room.room,
+                                                 "env": room.seal(admin, inner)})
+
+            assert (await send_message())["type"] == "ack"
+            denied = await room.change(admin, "rotate")
+            assert denied["type"] == "error", denied
+            assert denied["code"] == 429 and denied["err"] == "rate_limited"
+            srv.relay.clock.advance(1)
+            assert (await room.change(admin, "rotate"))["type"] == "ack"
+            denied = await send_message()
+            assert denied["type"] == "error", denied
+            assert denied["code"] == 429 and denied["err"] == "rate_limited"
+    run(body())
+
+
 def test_invite_join_request_add_and_no_history():
     async def body():
         async with relay_server() as srv:

@@ -231,7 +231,7 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_SLOW_KEY_MINUTES` | `0` (official: `10`) | A key younger than this is in slow mode (0 = off). |
 | `SC2_SLOW_UNTIL_POSTS` | `0` | Also keep a key in slow mode until it has this many accepted posts (0 = off). |
 | `SC2_SLOW_PER_MIN` / `SC2_SLOW_BURST` / `SC2_SLOW_BODY_MAX` | `2` / `1` / `256` | Slow-mode limits. |
-| `SC2_SEND_PER_MIN` / `SC2_SEND_BURST` | `120` / `30` | DM and room sends per device. |
+| `SC2_SEND_PER_MIN` / `SC2_SEND_BURST` | `120` / `30` | Shared per-device limit for DMs, private-room messages, private-room creation, membership commits and invite join requests. |
 | `SC2_CLAIM_PER_MIN` | `20` | `keys.claim` per device. |
 | `SC2_REGISTER_PER_HOUR` | `30` | New device registrations per IP. |
 | `SC2_REPORT_PER_MIN` | `5` | Reports per device. |

@@ -738,6 +738,9 @@ class Session:
 
     def _commit_apply(self, room, new_state, f, old_members):
         r = self.relay
+        wait = r.send_rate.take(self.device, r.clock(), r.cfg.send_per_min, r.cfg.send_burst)
+        if wait:
+            raise ProtocolError(429, "rate_limited", None, retry_ms=wait)
         st = r.store
         now = r.now()
         added = sorted(new_state.members - old_members)
