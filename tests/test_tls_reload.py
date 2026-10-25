@@ -190,7 +190,7 @@ def test_certbot_deploy_hook_feeds_the_relay(tmp_path):
     k = str(live / "privkey.pem")
     _key(k)
     _cert(k, str(live / "fullchain.pem"), "relay.example.org", 1)
-    env = dict(os.environ, RENEWED_LINEAGE=str(live), SC2_CERT_DIR=str(certs), SC2_RELAY_UID=str(os.getuid()),
+    env = dict(os.environ, RENEWED_LINEAGE=str(live), SC2_ACME_CERT_DIR=str(certs), SC2_RELAY_UID=str(os.getuid()),
                SC2_RELAY_GID=str(os.getgid()))
     hook = os.path.join(DEPLOY, "deploy-hook.sh")
     subprocess.run(["sh", hook], env=env, check=True, capture_output=True)
@@ -231,3 +231,40 @@ def test_certbot_sidecar_keeps_the_key():
         c = config.Config.from_env(env)
         assert c.tls_enabled
     assert c.tls_cert == "/certs/cert.pem"  # selfhost keeps its own certificate
+
+
+def _run_sidecar(tmp_path, staging):
+    """run.sh with a stand-in certbot that records its arguments, and a
+    sleep that ends the renewal loop."""
+    bin_, certs = tmp_path / "bin", tmp_path / "certs"
+    bin_.mkdir(exist_ok=True)
+    certs.mkdir(exist_ok=True)
+    for f in ("fullchain.pem", "privkey.pem"):
+        (certs / f).write_text("x")
+    log = tmp_path / "certbot.args"
+    (bin_ / "certbot").write_text('#!/bin/sh\necho "$@" >> "%s"\n' % log)
+    (bin_ / "sleep").write_text("#!/bin/sh\nkill -TERM $PPID\n")
+    for f in ("certbot", "sleep"):
+        os.chmod(bin_ / f, 0o755)
+    env = dict(os.environ, PATH=str(bin_) + os.pathsep + os.environ["PATH"], SC2_ACME_DOMAIN="relay.example.org",
+               SC2_ACME_EMAIL="ops@example.org", SC2_ACME_CERT_DIR=str(certs), SC2_HOOKS_DIR=DEPLOY)
+    if staging is not None:
+        env["SC2_ACME_STAGING"] = staging
+    if log.exists():
+        log.unlink()
+    p = subprocess.run(["sh", os.path.join(DEPLOY, "run.sh")], env=env, capture_output=True, text=True, timeout=20)
+    return p, (log.read_text() if log.exists() else "")
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="no POSIX sh")
+def test_certbot_sidecar_parses_staging_like_the_relay(tmp_path):
+    for value, staged in ((None, False), ("", False), ("false", False), ("0", False), ("No", False),
+                          ("off", False), ("true", True), ("1", True), ("YES", True), ("on", True)):
+        p, args = _run_sidecar(tmp_path, value)
+        assert p.returncode == 0, (value, p.stderr)
+        assert "certonly" in args and "-d relay.example.org" in args, args
+        assert ("--staging" in args) == staged, (value, args)
+        assert "--deploy-hook %s/deploy-hook.sh" % DEPLOY in args
+    p, args = _run_sidecar(tmp_path, "maybe")
+    assert p.returncode != 0 and "SC2_ACME_STAGING must be true or false" in p.stderr
+    assert args == ""

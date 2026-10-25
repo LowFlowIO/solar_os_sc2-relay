@@ -1,0 +1,24 @@
+# Sample Caddy front end for the SC2 relay (the optional "caddy" service,
+# commented out in docker-compose.yml). Caddy gets its own certificate for
+# the site and proxies HTTPS (/.well-known/solaros-relay, the web view) and
+# wss://HOST/sc2 to the relay's HTTP port. chats:// on 7778 does not go
+# through Caddy.
+#
+# The site name comes from SC2_ACME_DOMAIN in relay.env; write the name here
+# instead if you do not use the certbot sidecar. Set SC2_TRUST_PROXY=true in
+# relay.env so the relay takes client IPs from X-Forwarded-For, and keep the
+# relay's HTTP port unreachable except through Caddy (docker-compose.yml
+# publishes it on 127.0.0.1 only).
+#
+# Port 80: Caddy and the certbot sidecar's standalone mode both want it.
+# Run certbot in webroot mode instead (SC2_ACME_WEBROOT=/var/www/acme, the
+# same host directory mounted into both containers at /var/www/acme) and
+# uncomment the handle block below.
+
+{$SC2_ACME_DOMAIN} {
+	# handle /.well-known/acme-challenge/* {
+	# 	root * /var/www/acme
+	# 	file_server
+	# }
+	reverse_proxy relay:8080
+}

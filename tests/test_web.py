@@ -3,11 +3,12 @@
 SPDX-License-Identifier: MIT
 """
 
+import asyncio
 import json
 
 import sc2ref
 from sc2proto import frames
-from helpers import Device, admin, free_port, http_get, relay_server, run
+from helpers import Device, admin, free_port, http_get, make_config, relay_server, run
 
 ROOM = "pub:general"
 
@@ -129,3 +130,25 @@ def test_metrics_have_no_device_ids():
                     name, value = line.split(" ")
                     float(value)
     run(body())
+
+
+def test_container_healthcheck(tmp_path):
+    from sc2_relay import healthcheck
+
+    async def body():
+        async with relay_server(http_port=free_port()) as srv:
+            ok, why = await asyncio.get_running_loop().run_in_executor(
+                None, healthcheck.check, make_config(str(tmp_path), http_port=srv.ports["http"]))
+            assert ok, why
+            # HTTP off: the plain chat:// port answers a TCP connect
+            ok, why = await asyncio.get_running_loop().run_in_executor(
+                None, healthcheck.check, make_config(str(tmp_path), http_port=0, plain_port=srv.ports["plain"]))
+            assert ok and why.startswith("tcp "), why
+    run(body())
+    # nothing listening
+    ok, why = healthcheck.check(make_config(str(tmp_path), http_port=free_port()), timeout=1)
+    assert not ok
+    # chats:// only, waiting for the first Let's Encrypt certificate: healthy
+    ok, why = healthcheck.check(make_config(str(tmp_path), http_port=0, plain=False, acme_domain="relay.example.org",
+                                            acme_cert_dir=str(tmp_path / "none")))
+    assert ok and "waiting" in why, why

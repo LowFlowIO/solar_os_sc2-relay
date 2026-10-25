@@ -62,7 +62,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 `docker-compose.yml` includes a `certbot` sidecar (`deploy/certbot/run.sh`):
 
 1. Point the domain's DNS at the host and open port 80 (HTTP-01) and 7778.
-2. In `relay.env` set `SC2_ACME_DOMAIN=relay.example.org` and `SC2_ACME_EMAIL=ops@example.org` (try `SC2_ACME_STAGING=true` first). Leave `SC2_TLS_CERT`/`SC2_TLS_KEY` unset: with `SC2_ACME_DOMAIN` they default to `$SC2_ACME_CERT_DIR/fullchain.pem` and `privkey.pem` (`/certs`).
+2. In `relay.env` set `SC2_ACME_DOMAIN=relay.example.org` and `SC2_ACME_EMAIL=ops@example.org` (try `SC2_ACME_STAGING=true` first; it takes the same true/false values as the relay's settings, and anything else stops the sidecar). Leave `SC2_TLS_CERT`/`SC2_TLS_KEY` unset: with `SC2_ACME_DOMAIN` they default to `$SC2_ACME_CERT_DIR/fullchain.pem` and `privkey.pem` (`/certs`). The deploy hook writes to the same `SC2_ACME_CERT_DIR`; `docker-compose.yml` sets it to `/certs` for both services.
 3. `docker compose up -d`. certbot gets the certificate (standalone on :80; or set `SC2_ACME_WEBROOT` if a web server you already run answers `/.well-known/acme-challenge/` from a shared directory), and its deploy hook (`deploy/certbot/deploy-hook.sh`) copies the pair into the `relay-certs` volume, `0600`, owned by the relay's fixed UID/GID 10001. Until the first certificate exists the relay serves HTTP only and opens `chats://` as soon as the files appear.
 4. Renewal: certbot runs `certbot renew` every 12 hours (`SC2_ACME_RENEW_INTERVAL`) and renews within 30 days of expiry. The relay hot-reloads the new pair; nothing restarts.
 
@@ -99,13 +99,17 @@ The TLS key is separate from the relay's Ed25519 **signing** key (`relay_key`), 
 ### Docker
 
 ```sh
-docker build -t sc2-relay .      # from the repository root
+docker build -t sc2-relay:0.4.1 .  # from the repository root; the tag docker-compose.yml uses
 cp config/official.env relay.env   # or selfhost.env; edit it (see TLS above)
-docker compose up -d
+docker compose up -d               # builds the image itself if it is missing
 docker compose exec relay python -m sc2_relay.admin status
 ```
 
-The image runs as an unprivileged user with the fixed UID/GID 10001 and keeps everything persistent in the `/data` volume. It exposes 7778, 7777 and 8080. The admin API stays on 127.0.0.1:7780 *inside* the container and is not published. The compose file drops all capabilities and uses a read-only root filesystem. *(The Docker files, including the certbot sidecar, were not built or run against Let's Encrypt during development, because no Docker engine or public host was available. The deploy hook and the relay's reload path are exercised by `tests/test_tls_reload.py`.)*
+The image runs as an unprivileged user with the fixed UID/GID 10001 and keeps everything persistent in the `/data` volume. It exposes 7778, 7777 and 8080. The admin API stays on 127.0.0.1:7780 *inside* the container and is not published. The compose file drops all capabilities and uses a read-only root filesystem. The image's health check (`python -m sc2_relay.healthcheck`) asks `/healthz` on the HTTP port (over HTTPS with `SC2_HTTP_TLS`); with `SC2_HTTP_PORT=0` it connects to the `chat://` or `chats://` port instead, and it reports healthy while the relay waits for its first Let's Encrypt certificate.
+
+The test suite does not build the image or talk to Let's Encrypt. It runs the certbot deploy hook, the sidecar script's options (with a stand-in `certbot`) and the relay's reload path (`tests/test_tls_reload.py`). Point a new deployment at the staging CA first (`SC2_ACME_STAGING=true`).
+
+`docker-compose.yml` also has an optional Caddy front end for `https://` and `wss://HOST/sc2`, commented out and not enabled by default. Its sample configuration is `deploy/caddy/Caddyfile`; read the comments there about sharing port 80 with the certbot sidecar.
 
 ## HTTP surface (`SC2_HTTP_PORT`, default 8080)
 
@@ -122,7 +126,7 @@ The web view has its own per-IP rate limit (`SC2_WEB_RATE_PER_MIN`). It sets no 
 
 ### Signed descriptor and the relay key
 
-SolarOS adds a relay by domain (`messages add sc2 NAME DOMAIN`). It fetches `https://DOMAIN/.well-known/solaros-relay` with the CA bundle and host name checks only; there is no plain-HTTP or unverified fallback. Serve that path over HTTPS on port 443 with a CA certificate, for example with the Caddy front end in `docker-compose.yml`. The device verifies `descriptor_sig` over the descriptor with the key the descriptor names, pins that key in its profile, and from then on requires the relay to prove it at every login. The relay does this by signing the `nonce` from `hello` in `welcome.relay_sig`. A different key is a hard failure on the device. The byte layouts are in `protocol/sc2/include/sc2_relaykey.h` and `sc2proto/relaykey.py`.
+SolarOS adds a relay by domain (`messages add sc2 NAME DOMAIN`). It fetches `https://DOMAIN/.well-known/solaros-relay` with the CA bundle and host name checks only; there is no plain-HTTP or unverified fallback. Serve that path over HTTPS on port 443 with a CA certificate, for example with the optional Caddy front end (commented out in `docker-compose.yml`, sample `deploy/caddy/Caddyfile`). The device verifies `descriptor_sig` over the descriptor with the key the descriptor names, pins that key in its profile, and from then on requires the relay to prove it at every login. The relay does this by signing the `nonce` from `hello` in `welcome.relay_sig`. A different key is a hard failure on the device. The byte layouts are in `protocol/sc2/include/sc2_relaykey.h` and `sc2proto/relaykey.py`.
 
 The descriptor is short signed text, re-signed on each request:
 
@@ -190,7 +194,7 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_DESCRIPTOR_PIN` | `false` | Put the SPKI pin of the `chats://` certificate into the descriptor. |
 | `SC2_FALLBACK_RELAYS` | (empty) | Up to 3 comma-separated `URL KEY` pairs (`chats://host:port[#pin=sha256/...] <relay key b64>`) for the descriptor's fallback list. |
 | `SC2_ACME_DOMAIN` | empty | Let's Encrypt domain. The relay then reads `$SC2_ACME_CERT_DIR/fullchain.pem` and `privkey.pem` (unless `SC2_TLS_CERT/KEY` are set) and waits for them on first start. The certbot sidecar also reads `SC2_ACME_EMAIL`, `SC2_ACME_STAGING`, `SC2_ACME_WEBROOT` and `SC2_ACME_RENEW_INTERVAL`. |
-| `SC2_ACME_CERT_DIR` | `/certs` | Where certbot's deploy hook puts the pair. |
+| `SC2_ACME_CERT_DIR` | `/certs` | Where the relay reads the pair with `SC2_ACME_DOMAIN`, and where the certbot sidecar's deploy hook writes it. |
 | `SC2_TLS_RELOAD_INTERVAL` | `60` | Seconds between certificate file checks (0 = off; `SIGHUP` always reloads). |
 | `SC2_PLAIN` | `false` | Enable plain `chat://`. Use on a trusted LAN only, since metadata is visible on the wire. |
 | `SC2_PLAIN_PORT` | `7777` | `chat://` port. Legacy v1 clients use this or the TLS port; the relay recognises v1 by its first line. |

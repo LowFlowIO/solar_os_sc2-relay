@@ -17,7 +17,7 @@
 services:
   relay:
     build: .
-    image: sc2-relay:0.4.1
+    image: sc2-relay:0.4.1     # same tag as the README's docker build
     restart: unless-stopped
     env_file: ./relay.env
     environment:
@@ -44,6 +44,7 @@ services:
     environment:
       SC2_RELAY_UID: "10001"   # the relay image's fixed user (Dockerfile)
       SC2_RELAY_GID: "10001"
+      SC2_ACME_CERT_DIR: /certs  # where the deploy hook puts the pair (the relay's SC2_ACME_CERT_DIR)
     entrypoint: ["/bin/sh", "/hooks/run.sh"]
     ports:
       - "80:80"                # HTTP-01 (standalone). With SC2_ACME_WEBROOT, drop this and mount the webroot.
@@ -57,17 +58,20 @@ services:
     security_opt:
       - no-new-privileges:true
 
-  # Optional TLS front end for https:// (web view, /.well-known) and wss://host/sc2.
+  # Optional TLS front end for https:// (web view, /.well-known) and wss://HOST/sc2,
+  # not enabled by default. Uncomment it (and caddy-data below) to use it; the
+  # sample deploy/caddy/Caddyfile proxies everything to the relay's HTTP port.
   # Caddy gets its own certificate; if it takes port 80, run certbot with
-  # SC2_ACME_WEBROOT and let Caddy serve /.well-known/acme-challenge/ from it.
+  # SC2_ACME_WEBROOT and let Caddy serve /.well-known/acme-challenge/ from it
+  # (see the comments in the Caddyfile).
   # caddy:
   #   image: caddy:2
   #   restart: unless-stopped
+  #   env_file: ./relay.env      # SC2_ACME_DOMAIN names the site
   #   ports: ["443:443", "80:80"]
   #   volumes:
-  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - ./deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
   #     - caddy-data:/data
-  #   # Caddyfile:  relay.example.org { reverse_proxy relay:8080 }
 
 volumes:
   relay-data:
