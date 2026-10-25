@@ -1,9 +1,11 @@
-"""Connection slots: one session per device key, idle sessions (pings do not
-count), eviction of idle sessions when the relay is full, and the optional
-session lifetime.
+"""Connection slots: the absolute login deadline, one session per device
+key, idle sessions (pings do not count), eviction of idle sessions when the
+relay is full, and the optional session lifetime.
 
 SPDX-License-Identifier: MIT
 """
+
+import asyncio
 
 from helpers import Clock, Conn, Device, relay_server, run
 
@@ -62,16 +64,104 @@ def test_pings_do_not_keep_a_session_alive():
     run(body())
 
 
-def test_auth_timeout_unchanged_for_pending_sessions():
+HELLO = {"type": "hello", "v": 2, "proto": "sc2", "suites": [1], "client": "pytest/1"}
+
+
+def test_login_deadline_is_absolute_pings_do_not_extend_it():
     async def body():
         clock = Clock()
-        async with relay_server(clock=clock, auth_timeout=1) as srv:
+        async with relay_server(clock=clock, auth_timeout=30) as srv:
             c = await Conn.open(srv.ports["plain"])
-            await c.send({"type": "hello", "v": 2, "proto": "sc2", "suites": [1], "client": "pytest/1"})
+            await c.send(HELLO)
             assert (await c.recv())["type"] == "welcome"
-            clock.advance(10000)
-            assert srv.relay.sweep() == 0  # the sweep only handles established sessions
-            assert await c.closed(timeout=5)
+            # pings before auth are answered but do not move the deadline
+            for i in range(5):
+                clock.advance(5)
+                assert (await c.request({"type": "ping", "rid": "p%d" % i}))["type"] == "pong"
+                assert srv.relay.sweep() == 0
+            clock.advance(4.9)
+            assert srv.relay.sweep() == 0
+            clock.advance(0.1)
+            assert srv.relay.sweep() == 1
+            f = await _closed_with(c, 408, "auth_timeout")
+            assert "rid" not in f
+            assert srv.relay.metrics["sessions_auth_timeout_total"] == 1
+            assert not srv.relay.sessions
+            # an authenticated session is not touched by the login deadline
+            a = Device()
+            await a.connect(srv.ports["plain"])
+            clock.advance(60)
+            await a.conn.request({"type": "room.list", "rid": "l", "kind": "private"})
+            assert srv.relay.sweep() == 0
+    run(body())
+
+
+def test_login_deadline_for_a_half_sent_first_line():
+    async def body():
+        clock = Clock()
+        async with relay_server(clock=clock, auth_timeout=30) as srv:
+            bare = await Conn.open(srv.ports["plain"])
+            await bare.send(b'{"type":"hel')  # half a line, never finished
+            await bare.quiet(0.2)
+            clock.advance(29)
+            assert srv.relay.sweep() == 0
+            clock.advance(1)
+            assert srv.relay.sweep() == 1
+            await _closed_with(bare, 408, "auth_timeout")
+    run(body())
+
+
+def test_ping_only_client_is_closed_at_the_login_deadline_in_real_time():
+    async def body():
+        async with relay_server(auth_timeout=1) as srv:
+            c = await Conn.open(srv.ports["plain"])
+            await c.send(HELLO)
+            assert (await c.recv())["type"] == "welcome"
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            # ping for most of the second; a timeout that restarted at every
+            # frame would close only 1 s after the last one
+            for i in range(4):
+                assert (await c.request({"type": "ping", "rid": "p%d" % i}))["type"] == "pong"
+                await asyncio.sleep(0.2)
+            f = await c.expect("error", code=408)
+            closed_at = loop.time() - t0
+            assert f["err"] == "auth_timeout", f
+            assert closed_at < 1.7, closed_at
+            assert await c.closed()
+            assert not srv.relay.sessions
+    run(body())
+
+
+def test_trickled_bytes_do_not_extend_the_login_deadline():
+    async def body():
+        async with relay_server(auth_timeout=1) as srv:
+            c = await Conn.open(srv.ports["plain"])
+            loop = asyncio.get_running_loop()
+            t0 = loop.time()
+            line = b'{"type":"hello","v":2,"proto":"sc2","suites":[1]}'
+            # one byte every 0.1 s: every read returns data, none completes a line
+            for b in line[:9]:
+                c.writer.write(bytes([b]))
+                await c.writer.drain()
+                await asyncio.sleep(0.1)
+            f = await c.expect("error", code=408)
+            closed_at = loop.time() - t0
+            assert f["err"] == "auth_timeout"
+            assert closed_at < 1.7, closed_at
+            assert await c.closed()
+    run(body())
+
+
+def test_established_session_read_timeout_sends_the_reason():
+    async def body():
+        async with relay_server(idle_timeout=1) as srv:
+            a = Device()
+            await a.connect(srv.ports["plain"])
+            f = await a.conn.expect("error", code=408, timeout=5)
+            assert f["err"] == "idle"
+            assert await a.conn.closed()
+            assert srv.relay.metrics["sessions_idle_closed_total"] == 1
     run(body())
 
 

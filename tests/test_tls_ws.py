@@ -159,3 +159,40 @@ def test_websocket_refuses_v1_and_unmasked():
             st, h, b = await http_get(srv.ports["http"], "/sc2")
             assert st == 404
     run(body())
+
+
+def test_websocket_login_deadline_covers_pings_and_half_frames():
+    async def body():
+        async with relay_server(http_port=free_port(), auth_timeout=1) as srv:
+            loop = asyncio.get_running_loop()
+            # hello, then only pings (text and control frames)
+            ws = await WS.open(srv.ports["http"])
+            t0 = loop.time()
+            await ws.send({"type": "hello", "v": 2, "proto": "sc2", "suites": [1]})
+            assert (await ws.recv())["type"] == "welcome"
+            # ping (text and control frames) for most of the second; a timeout
+            # that restarted at every frame would close only 1 s after the last
+            got = []
+            for i in range(4):
+                await ws.send({"type": "ping", "rid": "p%d" % i})
+                await ws.send(b"x", opcode=9)
+                got += [await ws.recv(), await ws.recv()]
+                await asyncio.sleep(0.2)
+            assert {"type": "pong", "rid": "p3"} in got
+            f = await ws.recv()
+            closed_at = loop.time() - t0
+            assert f["type"] == "error" and f["code"] == 408 and f["err"] == "auth_timeout", f
+            assert (await ws.recv())["opcode"] == 8
+            assert closed_at < 1.7, closed_at
+            # a frame header with an extended length, then nothing
+            ws = await WS.open(srv.ports["http"])
+            t0 = loop.time()
+            ws.w.write(bytes([0x81, 0x80 | 126]))
+            await ws.w.drain()
+            f = await ws.recv()
+            assert f["type"] == "error" and f["code"] == 408 and f["err"] == "auth_timeout", f
+            assert (await ws.recv())["opcode"] == 8
+            assert loop.time() - t0 < 3
+            await asyncio.sleep(0.05)
+            assert not srv.relay.sessions
+    run(body())

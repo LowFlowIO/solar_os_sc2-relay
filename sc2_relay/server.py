@@ -223,10 +223,11 @@ class RelayServer:
                 log.exception("retention failed")
 
     async def _sweep_loop(self):
-        # idle and lifetime limits are enforced here, not by the read timeout,
-        # so a client that only sends pings is still closed after SC2_IDLE_TIMEOUT
+        # the login deadline, idle and lifetime limits are enforced here, not
+        # only by the read timeouts: a client that only sends pings, or
+        # trickles bytes before auth, is still closed on time
         c = self.config
-        interval = max(1, min(30, c.idle_timeout // 10, c.max_session_seconds or 30))
+        interval = max(1, min(30, c.auth_timeout // 5, c.idle_timeout // 10, c.max_session_seconds or 30))
         while True:
             await asyncio.sleep(interval)
             try:
@@ -243,6 +244,14 @@ class RelayServer:
             await self._ndjson_inner(reader, writer, transport)
         finally:
             self._conns.discard(t)
+
+    def _read_timeout(self, session, login_deadline):
+        """Seconds the next read may wait: until the absolute login deadline
+        before auth, SC2_IDLE_TIMEOUT after it. Data received before auth
+        does not move the deadline."""
+        if session.established:
+            return self.config.idle_timeout
+        return max(0.0, login_deadline - asyncio.get_running_loop().time())
 
     async def _ndjson_inner(self, reader, writer, transport):
         relay = self.relay
@@ -268,18 +277,16 @@ class RelayServer:
         def close():
             if not state["closing"]:
                 state["closing"] = True
-                try:
-                    writer.close()
-                except Exception:
-                    pass
+                _close_writer(writer)
 
         session = relay.new_session(ip, transport, write_line, close)
+        login_deadline = asyncio.get_running_loop().time() + self.config.auth_timeout
         try:
             while not state["closing"]:
-                timeout = self.config.idle_timeout if session.established else self.config.auth_timeout
                 try:
-                    data = await asyncio.wait_for(reader.read(8192), timeout)
+                    data = await asyncio.wait_for(reader.read(8192), self._read_timeout(session, login_deadline))
                 except asyncio.TimeoutError:
+                    session.read_timed_out()
                     break
                 if not data:
                     break
@@ -329,38 +336,47 @@ class RelayServer:
                 state["closing"] = True
                 try:
                     send_frame(0x8, struct.pack(">H", 1000))
-                    writer.close()
                 except Exception:
                     pass
+                _close_writer(writer)
+
+        async def read_frame():
+            # the whole frame (header, length, mask, payload) shares one
+            # timeout, so a peer that stalls half-way through a frame is
+            # closed like one that sends nothing
+            hdr = await reader.readexactly(2)
+            masked, n = hdr[1] & 0x80, hdr[1] & 0x7F
+            if hdr[0] & 0x70 or not masked:
+                return hdr, None  # extensions not negotiated; clients must mask (RFC 6455 5.1)
+            if n == 126:
+                n = struct.unpack(">H", await reader.readexactly(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", await reader.readexactly(8))[0]
+            if n > 16384 + 1024 or ((hdr[0] & 0x0F) >= 8 and n > 125):
+                return hdr, n
+            mask = await reader.readexactly(4)
+            data = bytearray(await reader.readexactly(n))
+            for i in range(n):
+                data[i] ^= mask[i & 3]
+            return hdr, bytes(data)
 
         session = relay.new_session(req.ip, "ws", write_line, close)
+        login_deadline = asyncio.get_running_loop().time() + self.config.auth_timeout
         frag = b""
         frag_op = None
         try:
             while not state["closing"]:
-                timeout = self.config.idle_timeout if session.established else self.config.auth_timeout
                 try:
-                    hdr = await asyncio.wait_for(reader.readexactly(2), timeout)
+                    hdr, data = await asyncio.wait_for(read_frame(), self._read_timeout(session, login_deadline))
                 except asyncio.TimeoutError:
+                    session.read_timed_out()
                     break
                 fin, op = hdr[0] & 0x80, hdr[0] & 0x0F
-                if hdr[0] & 0x70:
-                    break  # no extensions negotiated
-                masked, n = hdr[1] & 0x80, hdr[1] & 0x7F
-                if not masked:
-                    break  # clients must mask (RFC 6455 5.1)
-                if n == 126:
-                    n = struct.unpack(">H", await reader.readexactly(2))[0]
-                elif n == 127:
-                    n = struct.unpack(">Q", await reader.readexactly(8))[0]
-                if n > 16384 + 1024 or (op >= 8 and n > 125):
+                if data is None:
+                    break
+                if isinstance(data, int):
                     session.send(ProtocolError(413, "too_large", "frame too large").frame())
                     break
-                mask = await reader.readexactly(4)
-                data = bytearray(await reader.readexactly(n))
-                for i in range(n):
-                    data[i] ^= mask[i & 3]
-                data = bytes(data)
                 if op == 0x8:
                     break
                 if op == 0x9:
@@ -395,6 +411,20 @@ class RelayServer:
         finally:
             session.on_closed()
             close()
+
+
+def _close_writer(writer, grace=5.0):
+    """Close a client connection. A peer that stops reading (full send
+    buffer, unanswered TLS close_notify) would keep the socket open after
+    close(); it is aborted after a short grace period."""
+    try:
+        writer.close()
+    except Exception:
+        return
+    try:
+        asyncio.get_running_loop().call_later(grace, writer.transport.abort)
+    except Exception:
+        pass
 
 
 async def run(config):

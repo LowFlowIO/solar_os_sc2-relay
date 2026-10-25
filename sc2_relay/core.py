@@ -396,17 +396,28 @@ class Relay:
             self.metrics["sessions_evicted_total"] += 1
 
     def sweep(self):
-        """Close established sessions idle (no frame other than ping) for
-        SC2_IDLE_TIMEOUT, and those older than SC2_MAX_SESSION_SECONDS when
-        set. Returns the number closed. Runs periodically from the server."""
+        """Close sessions past one of their deadlines. Returns the number
+        closed. Runs periodically from the server.
+
+        - Unauthenticated sessions (no auth, no legacy v1 hello) get
+          SC2_AUTH_TIMEOUT from the moment they connected, whatever they
+          send meanwhile: pings, a slow trickle or half a frame do not
+          extend it (408 auth_timeout).
+        - Established sessions idle (no frame other than ping) for
+          SC2_IDLE_TIMEOUT (408 idle).
+        - Established sessions older than SC2_MAX_SESSION_SECONDS when set
+          (503 reconnect)."""
         now = self.clock()
         n = 0
         for s in list(self.sessions):
-            if s.closed or not s.established:
+            if s.closed:
                 continue
-            if now - s.active >= self.cfg.idle_timeout:
-                s.kick(408, "idle")
-                self.metrics["sessions_idle_closed_total"] += 1
+            if not s.established:
+                if now >= s.login_deadline:
+                    s.auth_timed_out()
+                    n += 1
+            elif now - s.active >= self.cfg.idle_timeout:
+                s.idled_out()
                 n += 1
             elif self.cfg.max_session_seconds and now - s.established >= self.cfg.max_session_seconds:
                 s.kick(503, "reconnect")
@@ -434,6 +445,8 @@ class Session:
         self.v1 = None
         self.closed = False
         self.created = relay.clock()
+        # absolute: nothing the client sends before auth moves it
+        self.login_deadline = self.created + relay.cfg.auth_timeout
         self.established = None    # clock time of auth (or legacy v1 hello)
         self.active = self.created  # last frame other than ping/pong
 
@@ -462,6 +475,25 @@ class Session:
             self.send(error_frame(code, err, text))
         self.close()
         self.on_closed(presence)
+
+    def auth_timed_out(self):
+        """The login deadline passed: 408 auth_timeout, then close."""
+        if not self.closed:
+            self.relay.metrics["sessions_auth_timeout_total"] += 1
+            self.kick(408, "auth_timeout")
+
+    def idled_out(self):
+        """No frame other than ping for SC2_IDLE_TIMEOUT: 408 idle, then close."""
+        if not self.closed:
+            self.relay.metrics["sessions_idle_closed_total"] += 1
+            self.kick(408, "idle")
+
+    def read_timed_out(self):
+        """The transport saw no data within the read timeout it was given."""
+        if self.established:
+            self.idled_out()
+        else:
+            self.auth_timed_out()
 
     def feed(self, data):
         self.relay.metrics["bytes_in_total"] += len(data)
