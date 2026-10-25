@@ -1,5 +1,5 @@
 """chats:// over TLS (port 7778 in production), the SPKI pin published in
-/.well-known, HTTPS for the HTTP listener, and the wss:///sc2 WebSocket
+/.well-known, HTTPS for the HTTP listener, and the wss://HOST/sc2 WebSocket
 endpoint.
 
 SPDX-License-Identifier: MIT

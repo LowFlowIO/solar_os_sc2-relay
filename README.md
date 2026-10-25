@@ -16,7 +16,7 @@ The relay is **isolated from the firmware core**: this repository (LowFlowIO/sol
 * **Public rooms** are signed plaintext. The relay **verifies every post signature on ingest**, keeps at most 7 days or 10,000 posts per room, and accepts bodies of at most 1,024 bytes. The first time a device joins a public room it gets a notice with the `PUBLIC · not encrypted` label. Rooms come from configuration (`SC2_PUBLIC_ROOMS`); clients cannot create them unless `SC2_PUBLIC_ROOM_CREATE=any`. Message IDs are chosen by clients and unique per author only, so a post is named by room, author (`from`) and ID: a `del` post deletes the sender's own post with that `ref`, and `room.report` takes an optional `author` (device ID, like `from`). A report without `author` is accepted only if exactly one post in the room has that ID; otherwise it gets `409 ambiguous_ref`. Reports store the resolved author (`admin reports`).
 * **Anti-spam** is limited to rate limits (per key, per IP, per room) and **slow mode**. Slow mode applies to young keys automatically (`SC2_SLOW_KEY_MINUTES`, optional `SC2_SLOW_UNTIL_POSTS`), and the operator can turn it on for a whole room. Nothing filters content.
 * **Moderation** covers public rooms only:
-  * Removals are **relay-signed** `room.mod` events. Clients verify them against the relay key published in `/.well-known/solaros-relay`.
+  * Removals are **relay-signed** `room.mod` events. Clients should verify them against the relay key published in `/.well-known/solaros-relay` before acting on them. The SolarOS client does not apply `room.mod` events yet: a removed post stays on devices that already received it, while the relay stops serving it (sync, web view, `/api/public`).
   * Bans target a key, an IP, or both, for an operator-set duration (or indefinitely).
   * Key bans are announced as a signed `room.mod ban`, and lifting one early as `room.mod unban`; IP bans are silent.
   * Private rooms and DMs cannot be moderated by the relay, because it cannot read them.
@@ -173,7 +173,7 @@ Bans and mutes apply to **public rooms only**. A banned key's posts get `403 ban
 
 ## Configuration
 
-All settings are environment variables. `--env-file FILE` loads `KEY=VALUE` lines first; values already in the environment take precedence. Two profiles share one codebase:
+All settings are environment variables. `--env-file FILE` loads `KEY=VALUE` lines first; values already in the environment take precedence. Two profiles share one codebase. The profile changes only the defaults of `SC2_LEGACY_V1` and `SC2_WEB_VIEW` and what startup allows; rate limits and slow mode have the same defaults under both, and `config/official.env` sets the official relay's values.
 
 * `SC2_PROFILE=selfhost` (default): legacy v1 on, web view off, mutes allowed.
 * `SC2_PROFILE=official`: v2 only (v1 hello → `426`), web view on, no mutes. Startup refuses `SC2_LEGACY_V1=true` or `SC2_MUTES=true` under this profile.
@@ -202,7 +202,7 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_HTTP_TLS` | `false` | Serve HTTP with the TLS certificate. |
 | `SC2_WEBSOCKET` | `true` | `/sc2` WebSocket. |
 | `SC2_METRICS` | `true` | `/metrics`. |
-| `SC2_TRUST_PROXY` | `false` | Take the client IP from `X-Forwarded-For` (HTTP and WS only). Turn on only behind your own proxy. |
+| `SC2_TRUST_PROXY` | `false` | Take the client IP from `X-Forwarded-For` (HTTP and WS only). Turn on only behind your own proxy, with the HTTP port reachable through it alone: otherwise anyone can forge the header and get round per-IP limits and bans. `config/official.env` turns it on for the Docker setup, which publishes the port on 127.0.0.1. |
 | `SC2_ADMIN_LISTEN` | `127.0.0.1:7780` | Admin API address. |
 | `SC2_ADMIN_TOKEN` | empty | Bearer token. Empty disables the admin API. |
 | `SC2_ADMISSION` | `open` | `open`, `code` (`hello.admit` must equal `SC2_ADMIT_CODE`) or `allowlist`. |
@@ -220,7 +220,7 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_LEGACY_V1_TOKEN` | empty | Optional v1 token (< 96 bytes). |
 | `SC2_V1_HISTORY` | `64` | v1 lines replayed per channel. |
 | `SC2_V1_MAX_CHANNELS` | `32` | v1 channel cap. |
-| `SC2_PUBLIC_ROOMS` | `general` | Configured public rooms (the `#` prefix is optional). |
+| `SC2_PUBLIC_ROOMS` | `general` | Comma-separated public rooms. The `pub:` prefix is optional: `general` and `pub:general` name the same room. |
 | `SC2_PUBLIC_ROOM_CREATE` | `operator` | `operator` (config only) or `any`. |
 | `SC2_PUBLIC_BODY_MAX` | `1024` | Public post body limit in bytes. |
 | `SC2_PUBLIC_LOG_MAX` | `10000` | Posts kept per public room. |
@@ -229,10 +229,10 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_WEB_PAGE_SIZE` | `100` | Posts per HTML page. |
 | `SC2_WEB_RATE_PER_MIN` | `120` | Web view requests per IP per minute. |
 | `SC2_MUTES` | `false` | Self-host mutes (`403 muted`). Not allowed under the official profile. |
-| `SC2_POST_PER_MIN` / `SC2_POST_BURST` | `100000` / `100000` (official: `10` / `5`) | Public posts per key. The selfhost defaults are effectively unlimited; set real limits for an open relay. |
-| `SC2_IP_POST_PER_MIN` / `SC2_IP_POST_BURST` | `100000` / `100000` (official: `30` / `10`) | Public posts per IP. |
-| `SC2_ROOM_POST_PER_MIN` | `1000000` (official: `600`) | Public posts per room. |
-| `SC2_SLOW_KEY_MINUTES` | `0` (official: `10`) | A key younger than this is in slow mode (0 = off). |
+| `SC2_POST_PER_MIN` / `SC2_POST_BURST` | `100000` / `100000` | Public posts per key. The defaults are effectively unlimited under both profiles; set real limits for an open relay (`config/official.env` sets `10` / `5`). |
+| `SC2_IP_POST_PER_MIN` / `SC2_IP_POST_BURST` | `100000` / `100000` | Public posts per IP (`config/official.env`: `30` / `10`). |
+| `SC2_ROOM_POST_PER_MIN` | `1000000` | Public posts per room (`config/official.env`: `600`). |
+| `SC2_SLOW_KEY_MINUTES` | `0` | A key younger than this is in slow mode (0 = off; `config/official.env`: `10`). |
 | `SC2_SLOW_UNTIL_POSTS` | `0` | Also keep a key in slow mode until it has this many accepted posts (0 = off). |
 | `SC2_SLOW_PER_MIN` / `SC2_SLOW_BURST` / `SC2_SLOW_BODY_MAX` | `2` / `1` / `256` | Slow-mode limits. |
 | `SC2_SEND_PER_MIN` / `SC2_SEND_BURST` | `120` / `30` | DM and room sends per device. |

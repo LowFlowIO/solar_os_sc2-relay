@@ -110,7 +110,7 @@ class Config:
             "tls_reload_interval": _int(env, "SC2_TLS_RELOAD_INTERVAL", 60, 0, 86400),
             "plain": _bool(env, "SC2_PLAIN", False),
             "plain_port": _int(env, "SC2_PLAIN_PORT", 7777, 0, 65535),
-            # HTTP: well-known, healthz, metrics, web view, wss:///sc2
+            # HTTP: well-known, healthz, metrics, web view, wss://HOST/sc2
             "http_port": _int(env, "SC2_HTTP_PORT", 8080, 0, 65535),
             "http_tls": _bool(env, "SC2_HTTP_TLS", False),
             "websocket": _bool(env, "SC2_WEBSOCKET", True),
