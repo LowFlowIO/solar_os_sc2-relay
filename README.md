@@ -208,14 +208,14 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_ADMISSION` | `open` | `open`, `code` (`hello.admit` must equal `SC2_ADMIT_CODE`) or `allowlist`. |
 | `SC2_ADMIT_CODE` | empty | Registration code. |
 | `SC2_ALLOWLIST` | empty | Comma-separated 32-hex device IDs. |
-| `SC2_TTL_DAYS` | `7` | Retention for inbox queues and public logs. |
+| `SC2_TTL_DAYS` | `7` | Retention for inbox queues and public/private room logs, including membership commits. |
 | `SC2_MAX_QUEUE` | `500` | Messages per device queue. |
 | `SC2_MAX_QUEUE_BYTES` | `5242880` | Bytes per device queue. |
 | `SC2_OPK_MAX` | `100` | One-time prekeys stored per device. |
 | `SC2_KEYS_LOW` | `5` | Send `keys.low` below this many OPKs. |
 | `SC2_ROOM_MEMBERS_MAX` | `32` | Private room size cap (≤ 32). |
 | `SC2_ROOMS_PER_DEVICE` | `64` | Private rooms a device may belong to. |
-| `SC2_PRIVATE_LOG_MAX` | `10000` | Room log entries kept per private room (also TTL-bounded). |
+| `SC2_PRIVATE_LOG_MAX` | `10000` | Messages, events and commits kept per private room (also TTL-bounded); stored commit copies expire with their log entries. |
 | `SC2_LEGACY_V1` | `true` (selfhost), `false` (official) | chatd-compatible v1 hub. |
 | `SC2_LEGACY_V1_TOKEN` | empty | Optional v1 token (< 96 bytes). |
 | `SC2_V1_HISTORY` | `64` | v1 lines replayed per channel. |
@@ -235,7 +235,7 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_SLOW_KEY_MINUTES` | `0` | A key younger than this is in slow mode (0 = off; `config/official.env`: `10`). |
 | `SC2_SLOW_UNTIL_POSTS` | `0` | Also keep a key in slow mode until it has this many accepted posts (0 = off). |
 | `SC2_SLOW_PER_MIN` / `SC2_SLOW_BURST` / `SC2_SLOW_BODY_MAX` | `2` / `1` / `256` | Slow-mode limits. |
-| `SC2_SEND_PER_MIN` / `SC2_SEND_BURST` | `120` / `30` | DM and room sends per device. |
+| `SC2_SEND_PER_MIN` / `SC2_SEND_BURST` | `120` / `30` | Shared per-device limit for DMs, private-room messages, private-room creation, membership commits and invite join requests. |
 | `SC2_CLAIM_PER_MIN` | `20` | `keys.claim` per device. |
 | `SC2_REGISTER_PER_HOUR` | `30` | New device registrations per IP. |
 | `SC2_REPORT_PER_MIN` | `5` | Reports per device. |
@@ -250,6 +250,8 @@ See `config/official.env` and `config/selfhost.env`.
 | `SC2_LOG_DEVICE_IDS` | `false` | Log device IDs; the default writes `<device>` instead. |
 
 Rate and limit values marked tunable can be changed at runtime with `admin tune`, which persists them in the database. Tunable keys are `admission`, `admit_code`, `post_per_min`, `post_burst`, `ip_post_per_min`, `ip_post_burst`, `room_post_per_min`, the `slow_*` settings, `max_queue`, `max_queue_bytes`, `ttl_days`, `send_per_min`, `send_burst` and `claim_per_min`.
+
+Private-room retention preserves the current epoch, commit head and membership even after every historical commit expires.
 
 ### Connection slots
 

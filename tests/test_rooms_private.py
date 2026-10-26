@@ -8,6 +8,7 @@ SPDX-License-Identifier: MIT
 
 import os
 
+import pytest
 import sc2ref
 from helpers import Device, PrivateRoom, b64e, layouts, relay_server, run
 from sc2proto import b64d
@@ -177,6 +178,165 @@ def test_commit_rules():
     run(body())
 
 
+def test_private_genesis_uses_device_send_limit():
+    async def body():
+        async with relay_server(send_per_min=60, send_burst=1) as srv:
+            admin = Device()
+            await admin.connect(srv.ports["plain"])
+            first, second = PrivateRoom(), PrivateRoom()
+            assert (await first.create(admin))["type"] == "ack"
+            denied = await second.create(admin)
+            assert denied["type"] == "error", denied
+            assert (denied["code"], denied["err"], denied["retry_ms"]) == (429, "rate_limited", 1000)
+            # Rejected genesis must not leave an empty room or a stored commit.
+            st = srv.relay.store
+            assert st.room(second.room) is None
+            assert st.commits(second.room) == []
+            assert st.room_log_range(second.room) == (None, None)
+            assert st.members(second.room) == []
+            srv.relay.clock.advance(1)
+            ack = await second.create(admin)
+            assert ack["type"] == "ack" and ack["epoch"] == 1
+            assert st.room(second.room)["head"] == second.state.head
+    run(body())
+
+
+def test_commit_retention_follows_room_log_cap():
+    async def body():
+        async with relay_server(private_log_max=2) as srv:
+            admin = Device()
+            await admin.connect(srv.ports["plain"])
+            first, second = PrivateRoom(), PrivateRoom()
+            for room in (first, second):
+                assert (await room.create(admin))["type"] == "ack"
+                assert (await room.change(admin, "rotate"))["type"] == "ack"
+            assert (await first.change(admin, "rotate"))["type"] == "ack"
+            st = srv.relay.store
+            before = [dict(st.room(room.room)) for room in (first, second)]
+            deleted = srv.relay.retention()
+            assert [r["epoch"] for r in st.commits(first.room)] == [2, 3]
+            assert [r["epoch"] for r in st.commits(second.room)] == [2]
+            assert deleted["commits"] == 2
+            assert [dict(st.room(room.room)) for room in (first, second)] == before
+            # Messages can evict every commit from one room's log. A commit
+            # with the same seq in another room must not preserve its copy.
+            for i in range(2):
+                ack = await admin.conn.request({"type": "room.send", "rid": admin.rid(), "room": first.room,
+                                                "env": first.seal(admin, {"t": "text", "body": "m%d" % i})})
+                assert ack["type"] == "ack"
+            deleted = srv.relay.retention()
+            assert deleted["commits"] == 2
+            assert st.commits(first.room) == []
+            assert [r["epoch"] for r in st.commits(second.room)] == [2]
+            assert (await first.change(admin, "rotate"))["epoch"] == 4
+            assert srv.relay.retention()["commits"] == 0
+            assert [r["epoch"] for r in st.commits(first.room)] == [4]
+    run(body())
+
+
+def test_commit_retention_preserves_state_across_restart(tmp_path):
+    async def body():
+        async with relay_server(tmp=str(tmp_path)) as srv:
+            clock = srv.relay.clock
+            admin, (bob,), room = await setup_room(srv.ports["plain"], 2)
+            assert (await room.change(admin, "promote", bob.id))["type"] == "ack"
+            assert (await room.change(bob, "remove", admin.id))["type"] == "ack"
+            st = srv.relay.store
+            before = dict(st.room(room.room))
+            members = [dict(m) for m in st.members(room.room)]
+            # Match the existing strict TTL boundary: expire only older records.
+            clock.advance(srv.config.ttl_days * 86400)
+            deleted = srv.relay.retention()
+            assert len(st.commits(room.room)) == 4
+            assert deleted.get("commits", 0) == 0
+            clock.advance(1)
+            deleted = srv.relay.retention()
+            assert st.commits(room.room) == []
+            assert deleted["commits"] == 4
+            assert st.room_log_range(room.room) == (None, None)
+            assert dict(st.room(room.room)) == before
+            assert [dict(m) for m in st.members(room.room)] == members
+            assert srv.relay.retention()["commits"] == 0
+        async with relay_server(tmp=str(tmp_path), clock=clock) as srv:
+            st = srv.relay.store
+            assert st.commits(room.room) == []
+            assert dict(st.room(room.room)) == before
+            assert [dict(m) for m in st.members(room.room)] == members
+            await admin.connect(srv.ports["plain"], sync=False)
+            await bob.connect(srv.ports["plain"], sync=False)
+            # Removal and admin promotion still apply after all history expires.
+            denied = await admin.conn.request(frame(room, room.commit(admin, "rotate"), admin.rid()))
+            assert denied["code"] == 403
+            commit = room.commit(bob, "rotate")
+            ack = await bob.conn.request(frame(room, commit, bob.rid()))
+            assert ack["type"] == "ack" and ack["epoch"] == 5
+            room.accept(commit)
+            assert ack["head"] == room.state.head
+            replay = await bob.conn.request(frame(room, commit, bob.rid()))
+            assert replay["code"] == 409 and replay["err"] == "epoch_conflict"
+            assert [r["epoch"] for r in st.commits(room.room)] == [5]
+    run(body())
+
+
+def test_rate_limited_commit_preserves_state_and_can_be_retried():
+    async def body():
+        async with relay_server(send_per_min=60, send_burst=2) as srv:
+            admin, (bob,), room = await setup_room(srv.ports["plain"], 2)
+            st = srv.relay.store
+            commit = room.commit(admin, "remove", bob.id)
+
+            def snapshot():
+                return {table: [tuple(row) for row in st.all("SELECT * FROM " + table)]
+                        for table in ("rooms", "members", "commits", "room_log", "inbox")}
+
+            before = snapshot()
+            denied = await admin.conn.request(frame(room, commit, admin.rid()))
+            assert denied["type"] == "error", denied
+            assert (denied["code"], denied["err"], denied["retry_ms"]) == (429, "rate_limited", 1000)
+            assert snapshot() == before
+            srv.relay.clock.advance(1)
+            # Invalid signatures must not consume the freshly refilled token.
+            bad = await admin.conn.request(frame(room, dict(commit, sig=b64e(bytes(64))), admin.rid()))
+            assert bad["code"] == 401 and bad["err"] == "bad_sig"
+            assert snapshot() == before
+            ack = await admin.conn.request(frame(room, commit, admin.rid()))
+            assert ack["type"] == "ack" and ack["epoch"] == 3
+            room.accept(commit)
+            assert ack["head"] == room.state.head
+            assert st.member(room.room, bob.id) is None
+            assert st.inbox_stats(bob.id)[0] == 1
+    run(body())
+
+
+@pytest.mark.parametrize("message_kind", ["dm", "room"])
+def test_private_commits_share_rate_with_messages(message_kind):
+    async def body():
+        async with relay_server(send_per_min=60, send_burst=3) as srv:
+            admin, (bob,), room = await setup_room(srv.ports["plain"], 2)
+            if message_kind == "dm":
+                await bob.publish(1)
+                admin.start_session(await admin.claim(bob.id))
+
+            async def send_message():
+                inner = {"t": "text", "body": "shared send quota"}
+                if message_kind == "dm":
+                    return await admin.conn.request({"type": "dm.send", "rid": admin.rid(), "to": bob.id,
+                                                     "env": admin.seal_dm(bob.id, inner)})
+                return await admin.conn.request({"type": "room.send", "rid": admin.rid(), "room": room.room,
+                                                 "env": room.seal(admin, inner)})
+
+            assert (await send_message())["type"] == "ack"
+            denied = await room.change(admin, "rotate")
+            assert denied["type"] == "error", denied
+            assert denied["code"] == 429 and denied["err"] == "rate_limited"
+            srv.relay.clock.advance(1)
+            assert (await room.change(admin, "rotate"))["type"] == "ack"
+            denied = await send_message()
+            assert denied["type"] == "error", denied
+            assert denied["code"] == 429 and denied["err"] == "rate_limited"
+    run(body())
+
+
 def test_invite_join_request_add_and_no_history():
     async def body():
         async with relay_server() as srv:
@@ -228,6 +388,58 @@ def test_invite_join_request_add_and_no_history():
             assert not any(f.get("event") == "join_request" for f in items)
             items, done = await admin.sync(rooms={room.room: "0"})
             assert any(f.get("event") == "join_request" for f in items)
+    run(body())
+
+
+@pytest.mark.parametrize("admin_reader", [False, True])
+@pytest.mark.parametrize("message_count", [0, 3])
+def test_sync_paginates_past_admin_only_events(admin_reader, message_count):
+    async def body():
+        async with relay_server() as srv:
+            port = srv.ports["plain"]
+            admin, (bob,), room = await setup_room(port, 2)
+            cursor = str(srv.relay.store.room(room.room)["seq"])
+            applicant = Device()
+            await applicant.connect(port)
+            key = os.urandom(32)
+            ack = await admin.conn.request({"type": "room.invite", "rid": admin.rid(),
+                                             "room": room.room, "key": b64e(key)})
+            assert ack["type"] == "ack"
+            proof = b64e(layouts.invite_proof(key, bytes.fromhex(applicant.id)))
+            expected = []
+            # More hidden events than fit in a page, before/between/after messages.
+            for i in range(message_count + 1):
+                for _ in range(5):
+                    assert (await applicant.join(room.room, proof))["type"] == "ack"
+                    event = await admin.conn.expect("room.event", event="join_request")
+                    if admin_reader:
+                        expected.append(event["seq"])
+                if i < message_count:
+                    env = room.seal(admin, {"t": "text", "body": "message %d" % i})
+                    ack = await admin.conn.request({"type": "room.send", "rid": admin.rid(),
+                                                     "room": room.room, "env": env})
+                    assert ack["type"] == "ack"
+                    expected.append(ack["seq"])
+            last = str(srv.relay.store.room(room.room)["seq"])
+            reader = admin if admin_reader else bob
+            reader.conn.close()
+            await reader.connect(port, sync=False)
+            received = []
+            for _ in range(50):
+                items, done = await reader.sync(rooms={room.room: cursor}, max_=2)
+                assert len(items) <= 2
+                if not admin_reader:
+                    assert all(f.get("event") != "join_request" for f in items)
+                received.extend(f["seq"] for f in items)
+                next_cursor = done["rooms"][room.room]
+                if not done["more"]:
+                    assert next_cursor == last
+                    break
+                assert int(next_cursor) > int(cursor)
+                cursor = next_cursor
+            else:
+                pytest.fail("private-room sync did not finish")
+            assert received == expected
     run(body())
 
 
